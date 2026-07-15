@@ -188,7 +188,71 @@ fn serve(
                 ),
             }
         }
+        "/api/events" => sse_view(
+            &mut stream,
+            ctx,
+            // Match-all standing view: every committed file delta becomes an
+            // invalidation tick the UI can refresh on.
+            parse("kMDItemFSSize >= 0").map_err(|e| std::io::Error::other(e.to_string()))?,
+        ),
+        "/api/alert" => {
+            let q = get("q").unwrap_or_default();
+            let threshold: f32 = get("threshold")
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0.35);
+            let sub = ctx
+                .live
+                .lock()
+                .unwrap()
+                .subscribe_alert(&q, threshold, vec![], 1024);
+            match sub {
+                Some((_, rx)) => sse_forward(&mut stream, rx),
+                None => respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    r#"{"error":"semantic disabled"}"#,
+                ),
+            }
+        }
         _ => respond(&mut stream, "404 Not Found", "{}"),
+    }
+}
+
+fn sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n"
+    )
+}
+
+fn sse_view(stream: &mut TcpStream, ctx: &IpcCtx, expr: rsd_query::Expr) -> std::io::Result<()> {
+    let (_, rx) = ctx.live.lock().unwrap().subscribe(expr, vec![], [], 4096);
+    sse_forward(stream, rx)
+}
+
+/// Forward live events as SSE until the client hangs up (write fails).
+fn sse_forward(
+    stream: &mut TcpStream,
+    rx: std::sync::mpsc::Receiver<rsd_live::LiveEvent>,
+) -> std::io::Result<()> {
+    sse_headers(stream)?;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            Ok(rsd_live::LiveEvent::Enter { path, .. }) => {
+                write!(stream, "data: {}\n\n", json!({"event":"enter","path":path}))?;
+            }
+            Ok(rsd_live::LiveEvent::Leave { path, .. }) => {
+                write!(stream, "data: {}\n\n", json!({"event":"leave","path":path}))?;
+            }
+            Ok(rsd_live::LiveEvent::Resync) => {
+                write!(stream, "data: {}\n\n", json!({"event":"resync"}))?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                write!(stream, ": ping\n\n")?; // heartbeat; detects dead peers
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+        stream.flush()?;
     }
 }
 

@@ -22,4 +22,5 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>LSUIElement</key><true/>
 </dict></plist>
 PLIST
+codesign --force --deep -s - "$APP" 2>/dev/null || true
 echo "built dist/RSD.app"

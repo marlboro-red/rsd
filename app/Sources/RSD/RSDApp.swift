@@ -82,6 +82,32 @@ final class SearchModel: ObservableObject {
     @Published var daemonUp = true
     @Published var selection: Hit.ID?
     private var task: Task<Void, Never>?
+    private var liveTask: Task<Void, Never>?
+
+    init() {
+        startLiveRefresh()
+    }
+
+    /// Results update in place: any committed change under the index nudges
+    /// the open query to re-run (debounced by search()'s own 90ms).
+    private func startLiveRefresh() {
+        liveTask = Task {
+            while !Task.isCancelled {
+                if let url = URL(string: "http://127.0.0.1:5871/api/events"),
+                   let (bytes, _) = try? await URLSession.shared.bytes(from: url) {
+                    do {
+                        for try await line in bytes.lines {
+                            guard line.hasPrefix("data: ") else { continue }
+                            if !self.query.trimmingCharacters(in: .whitespaces).isEmpty {
+                                self.search()
+                            }
+                        }
+                    } catch {}
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
+    }
 
     func search() {
         task?.cancel()
@@ -190,6 +216,12 @@ struct SearchView: View {
                     if model.query.isEmpty { NSApp.hide(nil) } else { model.query = "" }
                     return .handled
                 }
+                .background(
+                    // ⌘S: keep watching this query as a standing alert.
+                    Button("") { AlertStore.shared.add(query: model.query) }
+                        .keyboardShortcut("s", modifiers: .command)
+                        .opacity(0)
+                )
 
             VStack(alignment: .trailing, spacing: 3) {
                 Button(model.mode.rawValue) {

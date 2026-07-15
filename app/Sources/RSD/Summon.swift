@@ -6,6 +6,7 @@ import AppKit
 import Carbon
 import SwiftUI
 
+@MainActor
 final class Summoner: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
@@ -18,10 +19,12 @@ final class Summoner: NSObject, NSApplicationDelegate {
             systemSymbolName: "sparkle.magnifyingglass",
             accessibilityDescription: "RSD"
         )
-        item.button?.action = #selector(toggle)
+        item.button?.action = #selector(statusClicked)
         item.button?.target = self
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         statusItem = item
 
+        Notifier.shared.setUp()
         registerHotKey()
         showPalette()
     }
@@ -52,6 +55,43 @@ final class Summoner: NSObject, NSApplicationDelegate {
             0,
             &hotKeyRef
         )
+    }
+
+    @objc private func statusClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showMenu()
+        } else {
+            toggle()
+        }
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        let alerts = AlertStore.shared.alerts
+        if alerts.isEmpty {
+            let item = NSMenuItem(title: "No standing alerts — ⌘S in the palette", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        } else {
+            for alert in alerts {
+                let item = NSMenuItem(title: "≈ \(alert.query)", action: #selector(removeAlert(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = alert
+                item.toolTip = "Click to stop watching"
+                menu.addItem(item)
+            }
+        }
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit RSD", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        statusItem?.menu = menu
+        statusItem?.button?.performClick(nil)
+        statusItem?.menu = nil
+    }
+
+    @objc private func removeAlert(_ sender: NSMenuItem) {
+        if let alert = sender.representedObject as? SavedAlert {
+            AlertStore.shared.remove(alert)
+        }
     }
 
     @objc func toggle() {
