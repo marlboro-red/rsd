@@ -282,6 +282,7 @@ pub fn bring_up(
     journal_dir: &Path,
     root: &Path,
     mut content: Option<ContentIndexer>,
+    lexical: Option<(rsd_lexical::LexicalPlane, Arc<rsd_caes::Store>)>,
     cfg: PipelineConfig,
 ) -> std::io::Result<(Pipeline, ScanStats)> {
     let journal = Journal::open(
@@ -293,6 +294,9 @@ pub fn bring_up(
     )
     .map_err(|e| std::io::Error::other(format!("journal open: {e}")))?;
     let mut committer = Committer::new(catalog.clone(), journal);
+    if let Some((plane, caes)) = lexical {
+        committer = committer.with_lexical(plane, caes);
+    }
     let replayed = committer
         .recover()
         .map_err(|e| std::io::Error::other(format!("recovery: {e}")))?;

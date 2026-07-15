@@ -180,6 +180,9 @@ pub enum Change {
     SetContent {
         path: String,
         content_hash: [u8; 32],
+        /// CAES hints hash — with content_hash, extractor id/version and ABI
+        /// version this fully reconstructs the CAES key for plane rebuilds.
+        hints_hash: [u8; 32],
         state: String,
     },
 }
@@ -213,6 +216,7 @@ fn apply_change_in(t: &mut Tables<'_>, ch: &Change, now_ns: u64) -> Result<()> {
             path,
             content_hash,
             state,
+            ..
         } => {
             let oid = t.by_path.get(path.as_str())?.map(|g| g.value());
             if let Some(oid) = oid {
@@ -539,6 +543,15 @@ impl Catalog {
             }
         }
         Ok(out)
+    }
+
+    pub fn get_object(&self, oid: u64) -> Result<Option<ObjectRecord>> {
+        let txn = self.db.begin_read()?;
+        let objects = txn.open_table(OBJECTS)?;
+        match objects.get(oid)? {
+            Some(g) => Ok(Some(postcard::from_bytes(g.value())?)),
+            None => Ok(None),
+        }
     }
 
     pub fn get_by_fileid(&self, file_id: FileId) -> Result<Option<(u64, ObjectRecord)>> {

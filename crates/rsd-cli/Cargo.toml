@@ -1,0 +1,18 @@
+[package]
+name = "rsd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "rsdfind"
+
+[lints]
+workspace = true
+
+[dependencies]
+rsd-catalog = { workspace = true }
+rsd-lexical = { workspace = true }
+rsd-query = { workspace = true }
+
+[[bin]]
+name = "rsdfind"
+path = "src/bin/rsdfind.rs"

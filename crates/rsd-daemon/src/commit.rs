@@ -26,11 +26,31 @@ pub type Result<T> = std::result::Result<T, CommitError>;
 pub struct Committer {
     catalog: Arc<Catalog>,
     journal: Journal,
+    lexical: Option<(rsd_lexical::LexicalPlane, Arc<rsd_caes::Store>)>,
 }
 
 impl Committer {
     pub fn new(catalog: Arc<Catalog>, journal: Journal) -> Committer {
-        Committer { catalog, journal }
+        Committer {
+            catalog,
+            journal,
+            lexical: None,
+        }
+    }
+
+    /// Attach the lexical plane projection; applied after the catalog on every
+    /// commit, recovered from its own watermark.
+    pub fn with_lexical(
+        mut self,
+        plane: rsd_lexical::LexicalPlane,
+        caes: Arc<rsd_caes::Store>,
+    ) -> Committer {
+        self.lexical = Some((plane, caes));
+        self
+    }
+
+    pub fn lexical(&self) -> Option<&rsd_lexical::LexicalPlane> {
+        self.lexical.as_ref().map(|(p, _)| p)
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -46,6 +66,11 @@ impl Committer {
         }
         let (first, last) = self.journal.append(source, changes)?;
         self.catalog.apply_changes(first, changes)?;
+        if let Some((plane, caes)) = self.lexical.as_mut() {
+            if let Err(e) = plane.apply(first, changes, &self.catalog, caes) {
+                tracing::error!("lexical apply failed (plane lags, rebuildable): {e}");
+            }
+        }
         Ok(Some((first, last)))
     }
 

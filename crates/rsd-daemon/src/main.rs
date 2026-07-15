@@ -64,18 +64,25 @@ fn main() -> std::io::Result<()> {
     );
 
     // Content indexing: sealed worker pool, if the worker binary is present.
-    let content = match rsd_worker::WorkerPool::new(rsd_worker::PoolConfig::default()) {
+    let (content, lexical) = match rsd_worker::WorkerPool::new(rsd_worker::PoolConfig::default()) {
         Ok(pool) => {
-            let caes = rsd_caes::Store::open(&state.join("caes.redb"))
+            let caes = Arc::new(
+                rsd_caes::Store::open(&state.join("caes.redb"))
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
+            );
+            let plane = rsd_lexical::LexicalPlane::open(&state.join("lexical"))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
-            Some(rsd_daemon::ContentIndexer::new(
-                Box::new(rsd_daemon::PooledExtractor(pool)),
-                Arc::new(caes),
-            ))
+            (
+                Some(rsd_daemon::ContentIndexer::new(
+                    Box::new(rsd_daemon::PooledExtractor(pool)),
+                    caes.clone(),
+                )),
+                Some((plane, caes)),
+            )
         }
         Err(e) => {
             eprintln!("content indexing disabled (worker pool unavailable: {e})");
-            None
+            (None, None)
         }
     };
 
@@ -86,6 +93,7 @@ fn main() -> std::io::Result<()> {
         &state.join("journal"),
         &root,
         content,
+        lexical,
         PipelineConfig::default(),
     )?;
     eprintln!(

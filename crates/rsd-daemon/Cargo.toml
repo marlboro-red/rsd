@@ -16,6 +16,7 @@ rsd-log = { workspace = true }
 rsd-caes = { workspace = true }
 rsd-extract = { workspace = true }
 rsd-worker = { workspace = true }
+rsd-lexical = { workspace = true }
 blake3 = { workspace = true }
 redb = { workspace = true }
 thiserror = { workspace = true }
@@ -24,6 +25,8 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 rsd-testkit = { workspace = true }
+rsd-query = { workspace = true }
+rsd-lexical = { workspace = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }

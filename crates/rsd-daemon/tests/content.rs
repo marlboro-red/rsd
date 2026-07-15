@@ -87,6 +87,7 @@ fn setup(files: usize) -> Env {
         &base.join("journal"),
         &root,
         Some(indexer),
+        None,
         fast_cfg(),
     )
     .unwrap();

@@ -1,0 +1,20 @@
+[package]
+name = "rsd-lexical"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsd-catalog = { workspace = true }
+rsd-caes = { workspace = true }
+rsd-extract = { workspace = true }
+rsd-log = { workspace = true }
+tantivy = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

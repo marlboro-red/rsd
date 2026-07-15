@@ -142,11 +142,12 @@ impl ContentIndexer {
                 .unwrap_or_default(),
             full_size,
         };
+        let hints_hash = hints.hints_hash(truncated);
         let key = CaesKey {
             content_hash,
             extractor_id: EXTRACTOR_ID.into(),
             extractor_version: EXTRACTOR_VERSION,
-            hints_hash: hints.hints_hash(truncated),
+            hints_hash,
             abi_version: ABI_VERSION,
         };
 
@@ -196,6 +197,7 @@ impl ContentIndexer {
         Ok(Some(Change::SetContent {
             path: path.to_string(),
             content_hash,
+            hints_hash,
             state: status.as_str().to_string(),
         }))
     }

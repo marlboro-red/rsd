@@ -1,0 +1,16 @@
+[package]
+name = "rsd-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsd-catalog = { workspace = true }
+rsd-lexical = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

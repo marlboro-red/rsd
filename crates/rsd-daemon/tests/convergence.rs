@@ -78,6 +78,7 @@ fn live_storm_converges_with_zero_full_rescans() {
         &env.journal_dir,
         &env.root,
         None,
+        None,
         fast_cfg(),
     )
     .unwrap();
@@ -106,7 +107,15 @@ fn overflow_self_heals_with_counted_root_rescan() {
         event_capacity: 8, // force the callback to shed events
         ..fast_cfg()
     };
-    let (pipeline, _) = bring_up(env.cat.clone(), &env.journal_dir, &env.root, None, cfg).unwrap();
+    let (pipeline, _) = bring_up(
+        env.cat.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        None,
+        cfg,
+    )
+    .unwrap();
 
     for i in 0..400 {
         std::fs::write(env.root.join(format!("flood{i}.txt")), "x").unwrap();
@@ -135,6 +144,7 @@ fn rename_storm_preserves_object_identity() {
         env.cat.clone(),
         &env.journal_dir,
         &env.root,
+        None,
         None,
         fast_cfg(),
     )
@@ -188,6 +198,7 @@ fn dir_move_in_and_out_converges() {
         env.cat.clone(),
         &env.journal_dir,
         &env.root,
+        None,
         None,
         fast_cfg(),
     )
