@@ -638,6 +638,62 @@ fn value_num(v: &Value) -> f64 {
     }
 }
 
+// ------------------------------------------------------------- live support
+
+/// Evaluate an expression against ONE entry, with text/symbol predicates
+/// answered by the caller's single-doc matcher (P5.2). Used by the live-view
+/// engine, where no index scan is available or wanted.
+pub fn eval_live(
+    e: &Expr,
+    path: &str,
+    rec: &ObjectRecord,
+    text_match: &dyn Fn(&str, bool) -> bool,
+) -> bool {
+    match e {
+        Expr::And(v) => v.iter().all(|x| eval_live(x, path, rec, text_match)),
+        Expr::Or(v) => v.iter().any(|x| eval_live(x, path, rec, text_match)),
+        Expr::Not(b) => !eval_live(b, path, rec, text_match),
+        Expr::Text { terms } => text_match(terms, false),
+        Expr::Cmp {
+            attr: Attr::TextContent,
+            value: Value::Str { text, .. },
+            ..
+        } => text_match(text, false),
+        Expr::Cmp {
+            attr: Attr::Symbols,
+            value: Value::Str { text, .. },
+            ..
+        } => text_match(text, true),
+        Expr::Cmp { attr, op, value } => match (attr, value) {
+            (Attr::FsName, Value::Str { text, ci }) => {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let m = glob_match(text, name, *ci);
+                if *op == Op::Ne {
+                    !m
+                } else {
+                    m
+                }
+            }
+            (Attr::IndexState, Value::Str { text, ci }) => {
+                let state = rec.index_state.as_deref().unwrap_or("");
+                let m = glob_match(text, state, *ci);
+                if *op == Op::Ne {
+                    !m
+                } else {
+                    m
+                }
+            }
+            (Attr::FsSize, v) => cmp_f(*op, rec.size as f64, value_num(v)),
+            (Attr::ModificationDate, v) => cmp_f(*op, rec.mtime_ns as f64, value_num(v)),
+            _ => false,
+        },
+        Expr::InRange { attr, lo, hi } => match num_attr(*attr, rec) {
+            Some(v) => value_num(lo) <= v && v <= value_num(hi),
+            None => false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

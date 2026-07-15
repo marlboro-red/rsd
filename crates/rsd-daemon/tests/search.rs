@@ -93,6 +93,7 @@ fn setup() -> Env {
         &root,
         Some(indexer),
         Some((plane, caes.clone())),
+        None,
         fast_cfg(),
     )
     .unwrap();

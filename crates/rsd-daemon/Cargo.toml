@@ -17,6 +17,10 @@ rsd-caes = { workspace = true }
 rsd-extract = { workspace = true }
 rsd-worker = { workspace = true }
 rsd-lexical = { workspace = true }
+rsd-live = { workspace = true }
+rsd-ipc = { workspace = true }
+rsd-query = { workspace = true }
+nix = { workspace = true }
 blake3 = { workspace = true }
 redb = { workspace = true }
 thiserror = { workspace = true }

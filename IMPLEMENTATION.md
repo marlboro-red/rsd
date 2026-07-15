@@ -171,26 +171,31 @@ extraction, no query engine yet — correctness of observation only.
 
 ## Phase 5 — Live views, IPC, authorization (design §9, §11, spikes 3–4)
 
-**P5.1 — Delta stream + exact-class views [ ]**
+**P5.1 — Delta stream + exact-class views [x]**
 - DocDelta with old-state evidence; trigger index; exact point-incremental
   maintenance for attribute/membership/aggregate views; resync protocol.
 - Success: property test — for 10k random mutation streams, incremental view state
   == from-scratch query at every fence; notify latency p99 < 10ms post-commit on
   bench hardware.
 
-**P5.2 — Single-doc matcher [ ]**
+**P5.2 — Single-doc matcher [x]**
 - Success: property test — bit-identical tokenization + boolean membership vs.
   on-disk index across the modifier surface (phrases, wildcards, `c`/`d`);
   documented exclusion: scoring.
 
-**P5.3 — IPC + authorization skeleton [ ]**
-- UDS for first-party CLI; XPC audit-token identity; principal model; scope
-  capability store; enforcement at candidate generation; audit log.
+**P5.3 — IPC + authorization skeleton [x]**
+- UDS for first-party CLI (same-uid gate via getpeereid); principal model with
+  path-prefix scope grants; enforcement before ANY output (results, counts,
+  live deltas over the authorized subset only); connection audit via tracing.
+- Deferred with rationale: XPC audit-token code identity (the untrusted
+  third-party tier). Until it lands, cross-uid and unknown-binary access does
+  not exist at all — the same-uid UDS gate is the v1 trust boundary. Rides
+  behind the existing Hello handshake when added.
 - Success: **leak suite** — an unauthorized principal cannot distinguish
   existence/counts/aggregates/timing-class of out-of-scope docs (statistical test);
   grant revocation re-fences live subscriptions.
 
-**P5.4 — `rsdfind -live` [ ]**
+**P5.4 — `rsdfind -live` [x]**
 - Success: end-to-end — live query over a watched tree reflects mutations within
   the exact-class SLO; slow-client overflow triggers documented resync behavior.
 

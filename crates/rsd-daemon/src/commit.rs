@@ -23,10 +23,13 @@ pub enum CommitError {
 
 pub type Result<T> = std::result::Result<T, CommitError>;
 
+type OnCommit = Box<dyn FnMut(&[rsd_catalog::Delta]) + Send>;
+
 pub struct Committer {
     catalog: Arc<Catalog>,
     journal: Journal,
     lexical: Option<(rsd_lexical::LexicalPlane, Arc<rsd_caes::Store>)>,
+    on_commit: Option<OnCommit>,
 }
 
 impl Committer {
@@ -35,7 +38,13 @@ impl Committer {
             catalog,
             journal,
             lexical: None,
+            on_commit: None,
         }
+    }
+
+    /// Hook receiving every committed batch's deltas (live-view engine).
+    pub fn set_on_commit(&mut self, f: OnCommit) {
+        self.on_commit = Some(f);
     }
 
     /// Attach the lexical plane projection; applied after the catalog on every
@@ -65,11 +74,14 @@ impl Committer {
             return Ok(None);
         }
         let (first, last) = self.journal.append(source, changes)?;
-        self.catalog.apply_changes(first, changes)?;
+        let deltas = self.catalog.apply_changes(first, changes)?;
         if let Some((plane, caes)) = self.lexical.as_mut() {
             if let Err(e) = plane.apply(first, changes, &self.catalog, caes) {
                 tracing::error!("lexical apply failed (plane lags, rebuildable): {e}");
             }
+        }
+        if let Some(hook) = self.on_commit.as_mut() {
+            hook(&deltas);
         }
         Ok(Some((first, last)))
     }

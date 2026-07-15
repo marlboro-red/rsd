@@ -18,6 +18,53 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// -live: subscribe over the daemon's IPC socket and stream deltas.
+fn run_live(state: &std::path::Path, rql: &str) -> ! {
+    use rsd_ipc::{recv, send, Request, Response};
+    let sock = state.join("rsd.sock");
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap_or_else(|e| {
+        eprintln!("rsdfind: cannot reach daemon at {sock:?}: {e}");
+        std::process::exit(1);
+    });
+    send(
+        &mut stream,
+        &Request::Hello {
+            principal: "rsdfind".into(),
+        },
+    )
+    .unwrap();
+    let _: Response = recv(&mut stream).unwrap();
+    send(&mut stream, &Request::Subscribe { rql: rql.into() }).unwrap();
+    let stdout = std::io::stdout();
+    loop {
+        match recv::<Response>(&mut stream) {
+            Ok(Response::Subscribed(hits)) => {
+                let mut out = stdout.lock();
+                for h in hits {
+                    let _ = writeln!(out, "{}", h.path);
+                }
+                let _ = out.flush();
+            }
+            Ok(Response::Event { enter, path, .. }) => {
+                let mut out = stdout.lock();
+                let _ = writeln!(out, "{} {path}", if enter { "+" } else { "-" });
+                let _ = out.flush();
+            }
+            Ok(Response::Resync) => {
+                let mut out = stdout.lock();
+                let _ = writeln!(out, "! resync");
+                let _ = out.flush();
+            }
+            Ok(Response::Err(e)) => {
+                eprintln!("rsdfind: {e}");
+                std::process::exit(1);
+            }
+            Ok(_) => {}
+            Err(_) => std::process::exit(0),
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut state = None;
@@ -26,6 +73,7 @@ fn main() {
     let mut name_pat: Option<String> = None;
     let mut nul = false;
     let mut explain = false;
+    let mut live = false;
     let mut query_parts: Vec<String> = Vec::new();
 
     let mut it = args.into_iter();
@@ -36,6 +84,7 @@ fn main() {
             "-count" => count = true,
             "-name" => name_pat = it.next(),
             "-0" => nul = true,
+            "-live" => live = true,
             "--explain" => explain = true,
             _ => query_parts.push(a),
         }
@@ -62,6 +111,10 @@ fn main() {
         usage();
     }
     let src = clauses.join(" && ");
+
+    if live {
+        run_live(&state, &src);
+    }
 
     let expr = match parse(&src) {
         Ok(e) => e,

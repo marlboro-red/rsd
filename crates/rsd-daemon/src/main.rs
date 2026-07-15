@@ -86,6 +86,11 @@ fn main() -> std::io::Result<()> {
         }
     };
 
+    let caes_for_live = lexical.as_ref().map(|(_, c)| c.clone());
+    let live = Arc::new(std::sync::Mutex::new(rsd_live::LiveEngine::new(
+        caes_for_live,
+    )));
+
     eprintln!("bootstrapping {}...", root.display());
     let t0 = std::time::Instant::now();
     let (pipeline, boot) = bring_up(
@@ -94,8 +99,19 @@ fn main() -> std::io::Result<()> {
         &root,
         content,
         lexical,
+        Some(live.clone()),
         PipelineConfig::default(),
     )?;
+    let _ipc = rsd_daemon::ipc::start_ipc(
+        &state.join("rsd.sock"),
+        rsd_daemon::ipc::IpcCtx {
+            catalog: catalog.clone(),
+            lexical_dir: state.join("lexical"),
+            live,
+            authz: Arc::new(rsd_daemon::ipc::AuthzStore::default()),
+        },
+    )?;
+    eprintln!("ipc listening at {}", state.join("rsd.sock").display());
     eprintln!(
         "bootstrap done in {:?}: {} dirs, {} entries; watching (ctrl-c to exit)",
         t0.elapsed(),

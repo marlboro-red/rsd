@@ -12,6 +12,8 @@ members = [
     "crates/rsd-lexical",
     "crates/rsd-query",
     "crates/rsd-cli",
+    "crates/rsd-live",
+    "crates/rsd-ipc",
     "crates/rsd-testkit",
     "crates/rsd-daemon",
 ]
@@ -34,10 +36,12 @@ rsd-extract = { path = "crates/rsd-extract" }
 rsd-worker = { path = "crates/rsd-worker" }
 rsd-lexical = { path = "crates/rsd-lexical" }
 rsd-query = { path = "crates/rsd-query" }
+rsd-live = { path = "crates/rsd-live" }
+rsd-ipc = { path = "crates/rsd-ipc" }
 
 blake3 = "1"
 tantivy = "0.24"
-nix = { version = "0.29", features = ["socket", "uio"] }
+nix = { version = "0.29", features = ["socket", "uio", "user"] }
 encoding_rs = "0.8"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"

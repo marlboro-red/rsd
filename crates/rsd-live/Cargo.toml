@@ -1,0 +1,22 @@
+[package]
+name = "rsd-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsd-catalog = { workspace = true }
+rsd-caes = { workspace = true }
+rsd-extract = { workspace = true }
+rsd-query = { workspace = true }
+tantivy = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rsd-lexical = { workspace = true }

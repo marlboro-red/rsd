@@ -141,6 +141,8 @@ pub struct ObjectRecord {
     /// Extraction status string (queryable "kRSDIndexState"); None => content
     /// not yet indexed at the current stats.
     pub index_state: Option<String>,
+    /// CAES hints hash companion to content_hash (re-keys CAES from deltas).
+    pub caes_hints_hash: Option<[u8; 32]>,
 }
 
 /// What `apply_stat` did — used by scanners/tests for op accounting.
@@ -199,6 +201,23 @@ impl Change {
 
 const APPLIED_LSN: &str = "applied_lsn";
 
+/// One path's transition inside a committed batch: old and new object state
+/// (None = path not bound). The live-view engine's input.
+#[derive(Debug, Clone)]
+pub struct Delta {
+    pub path: String,
+    pub old: Option<(u64, ObjectRecord)>,
+    pub new: Option<(u64, ObjectRecord)>,
+}
+
+fn lookup_in(t: &Tables<'_>, path: &str) -> Result<Option<(u64, ObjectRecord)>> {
+    let oid = t.by_path.get(path)?.map(|g| g.value());
+    match oid {
+        Some(oid) => Ok(get_object(t, oid)?.map(|r| (oid, r))),
+        None => Ok(None),
+    }
+}
+
 pub struct Catalog {
     db: Database,
     durability: redb::Durability,
@@ -215,14 +234,15 @@ fn apply_change_in(t: &mut Tables<'_>, ch: &Change, now_ns: u64) -> Result<()> {
         Change::SetContent {
             path,
             content_hash,
+            hints_hash,
             state,
-            ..
         } => {
             let oid = t.by_path.get(path.as_str())?.map(|g| g.value());
             if let Some(oid) = oid {
                 if let Some(mut rec) = get_object(t, oid)? {
                     rec.content_hash = Some(*content_hash);
                     rec.index_state = Some(state.clone());
+                    rec.caes_hints_hash = Some(*hints_hash);
                     put_object(t, oid, &rec)?;
                 }
             }
@@ -307,6 +327,7 @@ fn apply_stat_in(t: &mut Tables<'_>, path: &str, st: &StatInfo, now_ns: u64) -> 
                 // Content may have changed: the indexed state is stale.
                 rec.content_hash = None;
                 rec.index_state = None;
+                rec.caes_hints_hash = None;
             }
             rec.size = st.size;
             rec.mtime_ns = st.mtime_ns;
@@ -348,6 +369,7 @@ fn apply_stat_in(t: &mut Tables<'_>, path: &str, st: &StatInfo, now_ns: u64) -> 
                 orphaned_at_ns: None,
                 content_hash: None,
                 index_state: None,
+                caes_hints_hash: None,
             };
             put_object(t, oid, &rec)?;
             t.by_fileid.insert(key.as_slice(), oid)?;
@@ -468,29 +490,33 @@ impl Catalog {
     /// batch (lsn <= watermark) is a no-op. `first_lsn` is the LSN of
     /// `changes[0]`; the batch must be LSN-contiguous (journal appends are).
     ///
-    /// Returns the number of changes actually applied (skipped ones were already
-    /// covered by the watermark).
-    pub fn apply_changes(&self, first_lsn: u64, changes: &[Change]) -> Result<u64> {
+    /// Returns per-path deltas (old/new object state) for every change
+    /// actually applied — the live-view engine's old-state evidence. Skipped
+    /// (watermark-covered) changes produce no delta.
+    pub fn apply_changes(&self, first_lsn: u64, changes: &[Change]) -> Result<Vec<Delta>> {
         if changes.is_empty() {
-            return Ok(0);
+            return Ok(vec![]);
         }
         self.with_write(|t| {
             let applied = t.meta.get(APPLIED_LSN)?.map(|g| g.value()).unwrap_or(0);
             let now = now_ns();
-            let mut n = 0u64;
+            let mut deltas = Vec::new();
             for (i, ch) in changes.iter().enumerate() {
                 let lsn = first_lsn + i as u64;
                 if lsn <= applied {
                     continue;
                 }
+                let path = ch.path().to_string();
+                let old = lookup_in(t, &path)?;
                 apply_change_in(t, ch, now)?;
-                n += 1;
+                let new = lookup_in(t, &path)?;
+                deltas.push(Delta { path, old, new });
             }
             let last = first_lsn + changes.len() as u64 - 1;
             if last > applied {
                 t.meta.insert(APPLIED_LSN, last)?;
             }
-            Ok(n)
+            Ok(deltas)
         })
     }
 

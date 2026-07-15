@@ -8,6 +8,7 @@
 
 pub mod commit;
 pub mod dispatch;
+pub mod ipc;
 
 pub use commit::{CommitError, Committer};
 pub use dispatch::{ContentCounters, ContentIndexer, ContentSource, PooledExtractor};
@@ -283,6 +284,7 @@ pub fn bring_up(
     root: &Path,
     mut content: Option<ContentIndexer>,
     lexical: Option<(rsd_lexical::LexicalPlane, Arc<rsd_caes::Store>)>,
+    live: Option<Arc<std::sync::Mutex<rsd_live::LiveEngine>>>,
     cfg: PipelineConfig,
 ) -> std::io::Result<(Pipeline, ScanStats)> {
     let journal = Journal::open(
@@ -296,6 +298,11 @@ pub fn bring_up(
     let mut committer = Committer::new(catalog.clone(), journal);
     if let Some((plane, caes)) = lexical {
         committer = committer.with_lexical(plane, caes);
+    }
+    if let Some(live) = live {
+        committer.set_on_commit(Box::new(move |deltas| {
+            live.lock().unwrap().on_commit(deltas);
+        }));
     }
     let replayed = committer
         .recover()

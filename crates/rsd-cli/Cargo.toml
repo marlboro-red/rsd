@@ -12,6 +12,7 @@ workspace = true
 rsd-catalog = { workspace = true }
 rsd-lexical = { workspace = true }
 rsd-query = { workspace = true }
+rsd-ipc = { workspace = true }
 
 [[bin]]
 name = "rsdfind"
