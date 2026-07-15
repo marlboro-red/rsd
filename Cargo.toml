@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsd-catalog",
+    "crates/rsd-ingest",
+    "crates/rsd-fsevents",
+    "crates/rsd-testkit",
+    "crates/rsd-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+rsd-catalog = { path = "crates/rsd-catalog" }
+rsd-ingest = { path = "crates/rsd-ingest" }
+rsd-fsevents = { path = "crates/rsd-fsevents" }
+rsd-testkit = { path = "crates/rsd-testkit" }
+
+redb = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+rand_chacha = "0.3"
+tempfile = "3"
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+lto = "thin"

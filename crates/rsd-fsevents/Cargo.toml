@@ -1,0 +1,14 @@
+[package]
+name = "rsd-fsevents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No workspace lints: this is the one crate allowed to contain unsafe (FFI).
+
+[dependencies]
+libc = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

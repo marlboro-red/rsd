@@ -1,0 +1,17 @@
+[package]
+name = "rsd-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsd-catalog = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rsd-testkit = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,20 @@
+[package]
+name = "rsd-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsd-catalog = { workspace = true }
+rsd-ingest = { workspace = true }
+rsd-fsevents = { workspace = true }
+redb = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+rsd-testkit = { workspace = true }
+tempfile = { workspace = true }
