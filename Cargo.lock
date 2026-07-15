@@ -1041,6 +1041,7 @@ dependencies = [
  "rsd-extract",
  "rsd-lexical",
  "rsd-query",
+ "rsd-vector",
  "tantivy",
  "tempfile",
  "tracing",

@@ -108,3 +108,106 @@ fn semantic_and_hybrid_queries_answer_through_the_daemon() {
     drop(vguard);
     pipeline.stop();
 }
+
+#[test]
+fn semantic_alert_fires_on_similar_content_only() {
+    use rsd_daemon::ipc::{start_ipc, AuthzStore, IpcCtx};
+    use rsd_ipc::{recv, send, Request, Response};
+    use rsd_live::LiveEngine;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let root = base.join("tree");
+    std::fs::create_dir(&root).unwrap();
+
+    let cat =
+        Arc::new(Catalog::open_with_durability(&base.join("cat.redb"), Durability::None).unwrap());
+    let caes = Arc::new(Store::open(&base.join("caes.redb")).unwrap());
+    let plane = LexicalPlane::open(&base.join("lexical")).unwrap();
+    let live = Arc::new(Mutex::new({
+        let mut e = LiveEngine::new(Some(caes.clone()));
+        e.set_embedder(Arc::new(HashEmbedder::default()));
+        e
+    }));
+    let indexer = ContentIndexer::new(Box::new(Src), caes.clone());
+    let (pipeline, _) = bring_up(
+        cat.clone(),
+        &base.join("journal"),
+        &root,
+        Some(indexer),
+        Some((plane, caes)),
+        None,
+        Some(live.clone()),
+        PipelineConfig {
+            coalescer: CoalescerConfig {
+                quiet: Duration::from_millis(100),
+                max_delay: Duration::from_secs(1),
+                max_pending: 65_536,
+            },
+            fsevents_latency: Duration::from_millis(50),
+            journal_sync: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let sock = base.join("rsd.sock");
+    start_ipc(
+        &sock,
+        IpcCtx {
+            catalog: cat,
+            lexical_dir: base.join("lexical"),
+            vector: None,
+            live,
+            authz: Arc::new(AuthzStore::default()),
+        },
+    )
+    .unwrap();
+
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    send(
+        &mut s,
+        &Request::Hello {
+            principal: "t".into(),
+        },
+    )
+    .unwrap();
+    let _: Response = recv(&mut s).unwrap();
+    send(
+        &mut s,
+        &Request::SubscribeAlert {
+            query: "invoice payment terms billing".into(),
+            threshold: 0.3,
+        },
+    )
+    .unwrap();
+    let Response::Subscribed(_) = recv::<Response>(&mut s).unwrap() else {
+        panic!("no sub ack")
+    };
+
+    // Unrelated content first: must NOT fire.
+    std::fs::write(
+        root.join("recipe.txt"),
+        "sourdough bread flour water salt yeast",
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    // Similar content: must fire.
+    std::fs::write(
+        root.join("q3.txt"),
+        "the quarterly invoice includes payment terms and a billing schedule",
+    )
+    .unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    match recv::<Response>(&mut s).unwrap() {
+        Response::Event {
+            enter: true, path, ..
+        } => {
+            assert!(
+                path.ends_with("q3.txt"),
+                "alert fired for wrong file: {path}"
+            );
+        }
+        other => panic!("expected alert Enter, got {other:?}"),
+    }
+    pipeline.stop();
+}

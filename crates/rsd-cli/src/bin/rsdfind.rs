@@ -65,6 +65,46 @@ fn run_live(state: &std::path::Path, rql: &str) -> ! {
     }
 }
 
+/// -live --semantic: a standing semantic alert (threshold classification).
+fn run_alert(state: &std::path::Path, query: &str, threshold: f32) -> ! {
+    use rsd_ipc::{recv, send, Request, Response};
+    let mut stream = std::os::unix::net::UnixStream::connect(state.join("rsd.sock"))
+        .unwrap_or_else(|e| {
+            eprintln!("rsdfind: cannot reach daemon: {e}");
+            std::process::exit(1);
+        });
+    send(
+        &mut stream,
+        &Request::Hello {
+            principal: "rsdfind".into(),
+        },
+    )
+    .unwrap();
+    let _: Response = recv(&mut stream).unwrap();
+    send(
+        &mut stream,
+        &Request::SubscribeAlert {
+            query: query.into(),
+            threshold,
+        },
+    )
+    .unwrap();
+    let stdout = std::io::stdout();
+    loop {
+        match recv::<Response>(&mut stream) {
+            Ok(Response::Event {
+                enter: true, path, ..
+            }) => {
+                let mut out = stdout.lock();
+                let _ = writeln!(out, "! {path}");
+                let _ = out.flush();
+            }
+            Ok(_) => {}
+            Err(_) => std::process::exit(0),
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut state = None;
@@ -76,6 +116,7 @@ fn main() {
     let mut live = false;
     let mut semantic = false;
     let mut hybrid = false;
+    let mut threshold = 0.35f32;
     let mut query_parts: Vec<String> = Vec::new();
 
     let mut it = args.into_iter();
@@ -88,6 +129,12 @@ fn main() {
             "-0" => nul = true,
             "-live" => live = true,
             "--semantic" => semantic = true,
+            "--threshold" => {
+                threshold = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage())
+            }
             "--hybrid" => hybrid = true,
             "--explain" => explain = true,
             _ => query_parts.push(a),
@@ -121,6 +168,9 @@ fn main() {
     let src = clauses.join(" && ");
 
     if live {
+        if semantic {
+            run_alert(&state, &query_parts.join(" "), threshold);
+        }
         run_live(&state, &src);
     }
 

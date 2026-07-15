@@ -87,8 +87,18 @@ pub enum LiveEvent {
     Resync,
 }
 
+enum ViewKind {
+    Expr(Expr),
+    /// Semantic alert (P6.4): threshold classification by design — "is this
+    /// new thing similar enough?" — never top-k (DESIGN.md §9).
+    Alert {
+        qvec: Vec<f32>,
+        threshold: f32,
+    },
+}
+
 struct View {
-    expr: Expr,
+    kind: ViewKind,
     /// Scope-prefix authorization baked in at subscribe time (P5.3): deltas
     /// outside the granted prefixes are invisible — no events, no counts.
     grants: Vec<String>,
@@ -99,6 +109,7 @@ struct View {
 
 pub struct LiveEngine {
     caes: Option<Arc<Store>>,
+    embedder: Option<Arc<dyn rsd_vector::Embedder>>,
     matcher: DocMatcher,
     views: HashMap<u64, View>,
     next_id: u64,
@@ -113,11 +124,43 @@ impl LiveEngine {
     pub fn new(caes: Option<Arc<Store>>) -> LiveEngine {
         LiveEngine {
             caes,
+            embedder: None,
             matcher: DocMatcher::new(),
             views: HashMap::new(),
             next_id: 1,
             deltas_processed: 0,
         }
+    }
+
+    /// Enable semantic alerts (requires an embedder for query vectors).
+    pub fn set_embedder(&mut self, e: Arc<dyn rsd_vector::Embedder>) {
+        self.embedder = Some(e);
+    }
+
+    /// Register a semantic alert: fires Enter when new/changed content clears
+    /// the similarity threshold for `query`.
+    pub fn subscribe_alert(
+        &mut self,
+        query: &str,
+        threshold: f32,
+        grants: Vec<String>,
+        buffer: usize,
+    ) -> Option<(u64, mpsc::Receiver<LiveEvent>)> {
+        let qvec = self.embedder.as_ref()?.embed(query);
+        let (tx, rx) = mpsc::sync_channel(buffer.max(16));
+        let id = self.next_id;
+        self.next_id += 1;
+        self.views.insert(
+            id,
+            View {
+                kind: ViewKind::Alert { qvec, threshold },
+                grants,
+                tx,
+                members: HashSet::new(),
+                needs_resync: false,
+            },
+        );
+        Some((id, rx))
     }
 
     /// Register a view. `initial_members` come from a one-shot query fenced by
@@ -135,7 +178,7 @@ impl LiveEngine {
         self.views.insert(
             id,
             View {
-                expr,
+                kind: ViewKind::Expr(expr),
                 grants,
                 tx,
                 members: initial_members.into_iter().collect(),
@@ -198,14 +241,31 @@ impl LiveEngine {
                 }
                 let new_state = d.new.as_ref().filter(|(_, r)| r.kind != ObjectKind::Dir);
                 let new_match = match new_state {
-                    Some((_, rec)) => {
-                        let cache = Self::text_of(&caes, rec);
-                        eval_live(&view.expr, &d.path, rec, &|terms, symbols| match &cache {
-                            Some(r) if symbols => matcher.matches_symbols(&r.symbols, terms),
-                            Some(r) => matcher.matches_text(&r.text, terms),
-                            None => false,
-                        })
-                    }
+                    Some((_, rec)) => match &view.kind {
+                        ViewKind::Expr(expr) => {
+                            let cache = Self::text_of(&caes, rec);
+                            eval_live(expr, &d.path, rec, &|terms, symbols| match &cache {
+                                Some(r) if symbols => matcher.matches_symbols(&r.symbols, terms),
+                                Some(r) => matcher.matches_text(&r.text, terms),
+                                None => false,
+                            })
+                        }
+                        ViewKind::Alert { qvec, threshold } => {
+                            match (Self::text_of(&caes, rec), self.embedder.as_ref()) {
+                                (Some(r), Some(emb)) => {
+                                    let best = rsd_vector::chunk(&r.text)
+                                        .into_iter()
+                                        .map(|(_, c)| {
+                                            let v = emb.embed(&c);
+                                            v.iter().zip(qvec).map(|(a, b)| a * b).sum::<f32>()
+                                        })
+                                        .fold(0f32, f32::max);
+                                    best >= *threshold
+                                }
+                                _ => false,
+                            }
+                        }
+                    },
                     None => false,
                 };
                 let oid_new = new_state.map(|(o, _)| *o);

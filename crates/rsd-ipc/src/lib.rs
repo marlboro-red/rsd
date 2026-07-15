@@ -30,6 +30,12 @@ pub enum Request {
     Subscribe {
         rql: String,
     },
+    /// Semantic alert: fire when new/changed content clears the similarity
+    /// threshold. Threshold semantics by design (never top-k).
+    SubscribeAlert {
+        query: String,
+        threshold: f32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

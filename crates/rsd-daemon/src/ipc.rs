@@ -126,6 +126,25 @@ fn serve_conn(mut stream: UnixStream, ctx: &IpcCtx) -> std::io::Result<()> {
                     .unwrap_or_else(Response::Err);
                 send(&mut stream, &resp).map_err(std::io::Error::other)?;
             }
+            Request::SubscribeAlert { query, threshold } => {
+                let sub = ctx.live.lock().unwrap().subscribe_alert(
+                    &query,
+                    threshold,
+                    grants.clone().unwrap_or_default(),
+                    1024,
+                );
+                let Some((_, rx)) = sub else {
+                    send(
+                        &mut stream,
+                        &Response::Err("daemon has no embedder (semantic disabled)".into()),
+                    )
+                    .map_err(std::io::Error::other)?;
+                    continue;
+                };
+                send(&mut stream, &Response::Subscribed(vec![])).map_err(std::io::Error::other)?;
+                forward_events(&mut stream, rx)?;
+                return Ok(());
+            }
             Request::Subscribe { rql } => {
                 let expr = match parse(&rql) {
                     Ok(e) => e,
@@ -150,39 +169,47 @@ fn serve_conn(mut stream: UnixStream, ctx: &IpcCtx) -> std::io::Result<()> {
                     (initial, rx)
                 };
                 send(&mut stream, &Response::Subscribed(initial)).map_err(std::io::Error::other)?;
-                // Dedicated stream from here on.
-                loop {
-                    match rx.recv_timeout(Duration::from_millis(500)) {
-                        Ok(LiveEvent::Enter { oid, path }) => {
-                            send(
-                                &mut stream,
-                                &Response::Event {
-                                    enter: true,
-                                    oid,
-                                    path,
-                                },
-                            )
-                            .map_err(std::io::Error::other)?;
-                        }
-                        Ok(LiveEvent::Leave { oid, path }) => {
-                            send(
-                                &mut stream,
-                                &Response::Event {
-                                    enter: false,
-                                    oid,
-                                    path,
-                                },
-                            )
-                            .map_err(std::io::Error::other)?;
-                        }
-                        Ok(LiveEvent::Resync) => {
-                            send(&mut stream, &Response::Resync).map_err(std::io::Error::other)?;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-                    }
-                }
+                forward_events(&mut stream, rx)?;
+                return Ok(());
             }
+        }
+    }
+}
+
+/// Dedicated event stream: forward live events until either side hangs up.
+fn forward_events(
+    stream: &mut UnixStream,
+    rx: std::sync::mpsc::Receiver<LiveEvent>,
+) -> std::io::Result<()> {
+    loop {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(LiveEvent::Enter { oid, path }) => {
+                send(
+                    stream,
+                    &Response::Event {
+                        enter: true,
+                        oid,
+                        path,
+                    },
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            Ok(LiveEvent::Leave { oid, path }) => {
+                send(
+                    stream,
+                    &Response::Event {
+                        enter: false,
+                        oid,
+                        path,
+                    },
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            Ok(LiveEvent::Resync) => {
+                send(stream, &Response::Resync).map_err(std::io::Error::other)?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
 }

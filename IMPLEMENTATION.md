@@ -210,7 +210,7 @@ extended; chunk-hash dedup counter tests (copy embeds nothing).
 **P6.3 — Hybrid retrieval [x]** (RRF fusion + semantic() operator shipped; NDCG eval harness pending) — RRF fusion, `semantic()` operator, stale-`semantic_gen`
 compensation. Success: NDCG-gated eval harness live (labeled local corpus); hybrid
 p50 < 15ms / p99 < 60ms.
-**P6.4 — Semantic alerts** — `ALERT WHEN` threshold class on the semantic watermark.
+**P6.4 — Semantic alerts [x]** (threshold classification on the live path, streamed over IPC via SubscribeAlert; `rsdfind -live --semantic --threshold N "query"`) — `ALERT WHEN` threshold class on the semantic watermark.
 Success: alert fires only after vector commit; fence/resync includes both
 watermarks.
 

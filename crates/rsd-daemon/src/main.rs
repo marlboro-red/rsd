@@ -98,9 +98,11 @@ fn main() -> std::io::Result<()> {
     });
     let vector_handle = vector.as_ref().map(|(p, _)| p.clone());
     let caes_for_live = lexical.as_ref().map(|(_, c)| c.clone());
-    let live = Arc::new(std::sync::Mutex::new(rsd_live::LiveEngine::new(
-        caes_for_live,
-    )));
+    let live = Arc::new(std::sync::Mutex::new({
+        let mut eng = rsd_live::LiveEngine::new(caes_for_live);
+        eng.set_embedder(Arc::new(rsd_vector::HashEmbedder::default()));
+        eng
+    }));
 
     eprintln!("bootstrapping {}...", root.display());
     let t0 = std::time::Instant::now();
