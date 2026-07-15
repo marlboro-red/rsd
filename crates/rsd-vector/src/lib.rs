@@ -329,6 +329,41 @@ impl VectorPlane {
     }
 }
 
+/// Which engine(s) surfaced a fused hit — provenance the UI can show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOrigin {
+    Exact,
+    Meaning,
+    Both,
+}
+
+impl MatchOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MatchOrigin::Exact => "exact",
+            MatchOrigin::Meaning => "meaning",
+            MatchOrigin::Both => "both",
+        }
+    }
+}
+
+/// RRF with per-hit provenance.
+pub fn rrf_tagged(lexical: &[u64], semantic: &[u64], k: usize) -> Vec<(u64, MatchOrigin)> {
+    let lex: std::collections::HashSet<u64> = lexical.iter().copied().collect();
+    let sem: std::collections::HashSet<u64> = semantic.iter().copied().collect();
+    rrf(lexical, semantic, k)
+        .into_iter()
+        .map(|oid| {
+            let origin = match (lex.contains(&oid), sem.contains(&oid)) {
+                (true, true) => MatchOrigin::Both,
+                (true, false) => MatchOrigin::Exact,
+                _ => MatchOrigin::Meaning,
+            };
+            (oid, origin)
+        })
+        .collect()
+}
+
 /// Reciprocal-rank fusion of two ranked oid lists (P6.3): 1/(60+rank).
 pub fn rrf(lexical: &[u64], semantic: &[u64], k: usize) -> Vec<u64> {
     let mut scores: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();

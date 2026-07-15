@@ -749,6 +749,19 @@ pub fn eval_live(
 impl<'a> QueryEngine<'a> {
     /// Hybrid retrieval (P6.3): RRF fusion of lexical and semantic top-k.
     pub fn hybrid(&self, text: &str, k: usize) -> Result<Vec<Hit>> {
+        Ok(self
+            .hybrid_tagged(text, k)?
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect())
+    }
+
+    /// Hybrid retrieval with per-hit provenance (which engine(s) matched).
+    pub fn hybrid_tagged(
+        &self,
+        text: &str,
+        k: usize,
+    ) -> Result<Vec<(Hit, rsd_vector::MatchOrigin)>> {
         let lex = self.lexical.ok_or(QueryError::NoLexicalPlane)?;
         let vp = self.vector.ok_or(QueryError::NoVectorPlane)?;
         let lexical = lex.search_content(text, false, k.max(50))?;
@@ -758,15 +771,18 @@ impl<'a> QueryEngine<'a> {
             .into_iter()
             .map(|h| h.oid)
             .collect();
-        let fused = rsd_vector::rrf(&lexical, &semantic, k);
+        let fused = rsd_vector::rrf_tagged(&lexical, &semantic, k);
         let mut out = Vec::with_capacity(fused.len());
-        for oid in fused {
+        for (oid, origin) in fused {
             if let Some(rec) = self.catalog.get_object(oid)? {
                 if let Some(p) = rec.entry_paths.first() {
-                    out.push(Hit {
-                        oid,
-                        path: p.clone(),
-                    });
+                    out.push((
+                        Hit {
+                            oid,
+                            path: p.clone(),
+                        },
+                        origin,
+                    ));
                 }
             }
         }

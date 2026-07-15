@@ -146,22 +146,31 @@ fn serve(
                 limit: limit.max(50),
             };
             let hits = match mode.as_str() {
-                "hybrid" if engine.vector.is_some() => engine.hybrid(&q, limit),
+                "hybrid" if engine.vector.is_some() => engine.hybrid_tagged(&q, limit).map(|v| {
+                    v.into_iter()
+                        .map(|(h, o)| (h, o.as_str()))
+                        .collect::<Vec<_>>()
+                }),
                 "semantic" => parse(&format!(r#"semantic("{}")"#, q.replace('"', "")))
-                    .and_then(|e| engine.run(&e, None)),
-                "rql" => parse(&q).and_then(|e| engine.run(&e, None)),
+                    .and_then(|e| engine.run(&e, None))
+                    .map(|v| v.into_iter().map(|h| (h, "meaning")).collect::<Vec<_>>()),
+                "rql" => parse(&q)
+                    .and_then(|e| engine.run(&e, None))
+                    .map(|v| v.into_iter().map(|h| (h, "rql")).collect::<Vec<_>>()),
                 _ => parse(&format!(r#""{}""#, q.replace('"', "")))
-                    .and_then(|e| engine.run(&e, None)),
+                    .and_then(|e| engine.run(&e, None))
+                    .map(|v| v.into_iter().map(|h| (h, "exact")).collect::<Vec<_>>()),
             };
             match hits {
                 Ok(hits) => {
                     let items: Vec<serde_json::Value> = hits
                         .iter()
                         .take(limit)
-                        .map(|h| {
+                        .map(|(h, origin)| {
                             json!({
                                 "path": h.path,
                                 "snippet": snippet(ctx, caes, h.oid, &q),
+                                "match": origin,
                             })
                         })
                         .collect();
