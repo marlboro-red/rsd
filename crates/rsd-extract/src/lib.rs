@@ -74,11 +74,15 @@ fn blake3_hasher() -> blake3::Hasher {
 pub enum Format {
     Source(Lang),
     PlainText,
+    Pdf,
     Binary,
 }
 
 /// Sniff by extension first, then content shape.
 pub fn sniff(hints: &ExtractHints, bytes: &[u8]) -> Format {
+    if bytes.starts_with(b"%PDF-") || hints.extension() == "pdf" {
+        return Format::Pdf;
+    }
     if let Some(lang) = Lang::from_extension(&hints.extension()) {
         return Format::Source(lang);
     }
@@ -126,6 +130,42 @@ pub fn extract_bytes(hints: &ExtractHints, budgets: &Budgets, bytes: &[u8]) -> E
 
     let format = sniff(hints, bytes);
     let (mut text, mut symbols, mut status) = match format {
+        Format::Pdf => {
+            // v1: pure-Rust extraction (pdfium upgrade tracked for quality).
+            // Panics are contained twice: locally here, and by the sealed
+            // worker process boundary if a parser bug slips past.
+            let result = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes));
+            match result {
+                Ok(Ok(text)) => {
+                    attrs.push(("rsd.format".into(), "pdf".into()));
+                    (text, vec![], ExtractStatus::Complete)
+                }
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    let status = if msg.to_lowercase().contains("encrypt") {
+                        ExtractStatus::EncryptedContent
+                    } else {
+                        ExtractStatus::Corrupt
+                    };
+                    attrs.push(("rsd.error".into(), msg));
+                    return ExtractionRecord {
+                        status,
+                        text: String::new(),
+                        attrs,
+                        symbols: vec![],
+                    };
+                }
+                Err(_) => {
+                    attrs.push(("rsd.error".into(), "pdf parser panic".into()));
+                    return ExtractionRecord {
+                        status: ExtractStatus::Corrupt,
+                        text: String::new(),
+                        attrs,
+                        symbols: vec![],
+                    };
+                }
+            }
+        }
         Format::Binary => {
             return ExtractionRecord {
                 status: ExtractStatus::Unsupported,
@@ -348,5 +388,79 @@ impl Catalog { fn open() {} }
         let src = "fn broken( {{{{ 中文 \u{0007} unclosed";
         let rec = extract_bytes(&hints("bad.rs", src.len() as u64), &b(), src.as_bytes());
         assert!(rec.text.contains("unclosed"));
+    }
+}
+
+#[cfg(test)]
+mod pdf_tests {
+    use super::*;
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    fn make_pdf(text: &str) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let resources_id = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn pdf_text_is_extracted() {
+        let bytes = make_pdf("Hello rsd PDF extraction net-60 terms");
+        let rec = extract_bytes(
+            &ExtractHints {
+                name: "doc.pdf".into(),
+                full_size: bytes.len() as u64,
+            },
+            &Budgets::default(),
+            &bytes,
+        );
+        assert_eq!(rec.status, ExtractStatus::Complete, "{:?}", rec.attrs);
+        assert!(rec.text.contains("net-60"), "{:?}", rec.text);
+    }
+
+    #[test]
+    fn garbage_pdf_is_typed_never_panics() {
+        let mut bytes = b"%PDF-1.7 utterly broken".to_vec();
+        bytes.extend_from_slice(&[0, 1, 2, 3, 255, 254]);
+        let rec = extract_bytes(
+            &ExtractHints {
+                name: "bad.pdf".into(),
+                full_size: bytes.len() as u64,
+            },
+            &Budgets::default(),
+            &bytes,
+        );
+        assert!(
+            matches!(
+                rec.status,
+                ExtractStatus::Corrupt | ExtractStatus::Unsupported
+            ),
+            "{:?}",
+            rec.status
+        );
     }
 }
