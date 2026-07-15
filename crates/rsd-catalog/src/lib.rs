@@ -9,6 +9,8 @@
 //! with later phases.
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+
+pub use redb::Durability;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,39 +24,32 @@ const NEXT_OID: &str = "next_oid";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    // Boxed: redb::Error is ~160 bytes and would bloat every Result.
     #[error("redb: {0}")]
-    Db(#[from] redb::Error),
+    Db(Box<redb::Error>),
     #[error("encode: {0}")]
     Encode(#[from] postcard::Error),
     #[error("invariant violated: {0}")]
     Invariant(String),
 }
 
-impl From<redb::TransactionError> for CatalogError {
-    fn from(e: redb::TransactionError) -> Self {
-        Self::Db(e.into())
-    }
+macro_rules! from_redb {
+    ($($t:ty),*) => {$(
+        impl From<$t> for CatalogError {
+            fn from(e: $t) -> Self {
+                Self::Db(Box::new(e.into()))
+            }
+        }
+    )*};
 }
-impl From<redb::TableError> for CatalogError {
-    fn from(e: redb::TableError) -> Self {
-        Self::Db(e.into())
-    }
-}
-impl From<redb::StorageError> for CatalogError {
-    fn from(e: redb::StorageError) -> Self {
-        Self::Db(e.into())
-    }
-}
-impl From<redb::CommitError> for CatalogError {
-    fn from(e: redb::CommitError) -> Self {
-        Self::Db(e.into())
-    }
-}
-impl From<redb::DatabaseError> for CatalogError {
-    fn from(e: redb::DatabaseError) -> Self {
-        Self::Db(e.into())
-    }
-}
+from_redb!(
+    redb::Error,
+    redb::TransactionError,
+    redb::TableError,
+    redb::StorageError,
+    redb::CommitError,
+    redb::DatabaseError
+);
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
 
@@ -615,7 +610,9 @@ mod tests {
         // Applier saw the removal event first: object becomes orphaned...
         assert!(cat.remove_path("/r/a").unwrap());
         // ...then the new path is probed. Same fileid+birthtime: identity kept.
-        let a = cat.apply_stat("/r/b", &st(ObjectKind::File, 7, 1, 5)).unwrap();
+        let a = cat
+            .apply_stat("/r/b", &st(ObjectKind::File, 7, 1, 5))
+            .unwrap();
         assert_eq!(a, Applied::RepointedPath(oid));
         cat.check_invariants().unwrap();
     }
@@ -626,7 +623,10 @@ mod tests {
         let mut s = st(ObjectKind::File, 20, 3, 9);
         s.nlink = 2;
         let oid = cat.apply_stat("/r/one", &s).unwrap().oid();
-        assert_eq!(cat.apply_stat("/r/two", &s).unwrap(), Applied::RepointedPath(oid));
+        assert_eq!(
+            cat.apply_stat("/r/two", &s).unwrap(),
+            Applied::RepointedPath(oid)
+        );
         assert_eq!(cat.entry_count().unwrap(), 2);
         assert_eq!(cat.object_count().unwrap(), 1);
 
@@ -657,9 +657,11 @@ mod tests {
     #[test]
     fn subtree_and_children() {
         let (_d, cat) = open_temp();
-        for (i, p) in ["/r", "/r/d", "/r/d/f1", "/r/d/f2", "/r/d/e", "/r/d/e/g", "/r/z"]
-            .iter()
-            .enumerate()
+        for (i, p) in [
+            "/r", "/r/d", "/r/d/f1", "/r/d/f2", "/r/d/e", "/r/d/e/g", "/r/z",
+        ]
+        .iter()
+        .enumerate()
         {
             let kind = if p.ends_with(['1', '2']) || *p == "/r/d/e/g" {
                 ObjectKind::File
@@ -670,7 +672,11 @@ mod tests {
         }
         assert_eq!(
             cat.children("/r/d").unwrap(),
-            vec!["/r/d/e".to_string(), "/r/d/f1".to_string(), "/r/d/f2".to_string()]
+            vec![
+                "/r/d/e".to_string(),
+                "/r/d/f1".to_string(),
+                "/r/d/f2".to_string()
+            ]
         );
         assert_eq!(cat.remove_subtree("/r/d").unwrap(), 5);
         assert_eq!(
@@ -686,7 +692,8 @@ mod tests {
         let db = dir.path().join("cat.redb");
         {
             let cat = Catalog::open(&db).unwrap();
-            cat.apply_stat("/r/a", &st(ObjectKind::File, 40, 8, 3)).unwrap();
+            cat.apply_stat("/r/a", &st(ObjectKind::File, 40, 8, 3))
+                .unwrap();
         }
         let cat = Catalog::open(&db).unwrap();
         let (_, rec) = cat.get_by_path("/r/a").unwrap().unwrap();

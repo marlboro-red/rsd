@@ -71,9 +71,8 @@ fn randomized_op_sequences_maintain_invariants() {
     const OPS_PER_SEQ: usize = 24;
 
     let dir = tempfile::tempdir().unwrap();
-    let cat =
-        Catalog::open_with_durability(&dir.path().join("cat.redb"), redb::Durability::None)
-            .unwrap();
+    let cat = Catalog::open_with_durability(&dir.path().join("cat.redb"), redb::Durability::None)
+        .unwrap();
     let mut m = Model::new();
 
     for seq in 0..SEQUENCES {

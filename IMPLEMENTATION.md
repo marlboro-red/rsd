@@ -12,13 +12,13 @@ Mapping to design tiers: Phases 0–5 ≈ T0, Phases 6–7 ≈ T1, Phase 8 ≈ T
 
 ## Phase 0 — Workspace scaffold
 
-**P0.1 — Cargo workspace [ ]**
+**P0.1 — Cargo workspace [x]**
 - `cargo build --workspace` and `cargo test --workspace` succeed on macOS arm64.
 - Crates: `rsd-catalog`, `rsd-ingest`, `rsd-fsevents`, `rsd-testkit`, `rsd-daemon`
   (further crates added by the phase that needs them).
 - Workspace-level lints: `unsafe_code` allowed only in `rsd-fsevents` (FFI).
 
-**P0.2 — CI gate script [ ]**
+**P0.2 — CI gate script [x]**
 - `scripts/ci.sh` runs fmt-check, clippy (deny warnings), and all tests; exits
   non-zero on any failure. (Becomes the hook for the permanent convergence gate.)
 
@@ -28,7 +28,7 @@ Goal: a catalog that provably converges to filesystem truth via bootstrap scan,
 scoped reconciliation, and FSEvents-driven incremental updates. No journal, no
 extraction, no query engine yet — correctness of observation only.
 
-**P1.1 — Catalog: FsObject/Entry store on redb [ ]**
+**P1.1 — Catalog: FsObject/Entry store on redb [x]**
 - Two-entity model: objects (identity: dev+ino+birthtime evidence) and entries
   (path → object, many-to-one), `by_path` and `by_fileid` indexes.
 - Success criteria:
@@ -39,13 +39,13 @@ extraction, no query engine yet — correctness of observation only.
     maintain invariants — no dangling entry→object refs, `by_path` and `by_fileid`
     exactly mirror entries/objects, object entry-lists match entries table.
 
-**P1.2 — Testkit: tree generator, mutator, convergence oracle [ ]**
+**P1.2 — Testkit: tree generator, mutator, convergence oracle [x]**
 - `gen_tree` (seeded, nested dirs/files/symlinks), `mutate` (seeded random
   create/write/delete/rename/mkdir/hardlink storms), `fs_listing`,
   `assert_converged(catalog, root)` comparing exact (path, kind, ino, size) sets.
 - Success criteria: deterministic under fixed seed; used by every later test.
 
-**P1.3 — Scan-based reconciliation [ ]**
+**P1.3 — Scan-based reconciliation [x]**
 - Bootstrap scan and scoped rescan (single-level and recursive) via readdir-diff
   against the catalog; symlinks recorded as links, never followed.
 - Success criteria:
@@ -54,16 +54,16 @@ extraction, no query engine yet — correctness of observation only.
   - Scoped rescan touches only the requested subtree (verified by op counters).
   - Full suite < 60s in CI.
 
-**P1.4 — Coalescer with structural backpressure [ ]**
+**P1.4 — Coalescer with structural backpressure [x]**
 - Bounded input channel; per-path debounce (500ms quiet, 5s cap); dedup; overflow
   degrades to scoped rescan markers (P4: queue memory O(directories)).
-- Success criteria (tokio paused-clock tests, no real FS needed):
+- Success criteria (pure state-machine tests with synthetic clock, no real FS needed):
   - N events on one path within quiet window → exactly one WorkItem.
   - Continuous events on one path → WorkItem within 5s cap.
   - Channel overflow → rescan marker set, no event loss unaccounted, no unbounded
     growth (asserted on internal map size).
 
-**P1.5 — FSEvents wrapper [ ]**
+**P1.5 — FSEvents wrapper [x]**
 - Safe wrapper over `FSEventStreamCreate` with `kFSEventStreamCreateFlagFileEvents`:
   event IDs, flag decoding (`MustScanSubDirs`, `EventIdsWrapped`, rename hints),
   callback → bounded channel handoff, clean start/stop, `sinceWhen` resume support.
@@ -71,7 +71,7 @@ extraction, no query engine yet — correctness of observation only.
   tempdir each produce decoded events with correct paths within 5s; stream stops
   cleanly (no leaked runloop thread — asserted via join with timeout).
 
-**P1.6 — End-to-end convergence harness (the permanent CI gate) [ ]**
+**P1.6 — End-to-end convergence harness (the permanent CI gate) [x]**
 - Pipeline: FSEvents → coalescer → applier (lstat-resolving work items → catalog).
   `lstat` is the truth-resolver: work items say *look here*, never *believe this*.
 - Success criteria:
