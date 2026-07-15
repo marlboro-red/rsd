@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    name: gate (fmt + clippy + tests)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: CI gate
+        run: ./scripts/ci.sh
+      - name: Build RSD.app (debug)
+        run: swift build --package-path app
+
+  release:
+    name: release artifacts
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release -p rsd-daemon -p rsd-cli -p rsd-worker
+      - name: Build RSD.app
+        run: ./scripts/build-app.sh
+      - name: Assemble bundle
+        run: |
+          mkdir -p dist/bin
+          cp target/release/rsd-daemon target/release/rsdfind \
+             target/release/rsd-mcp target/release/rsd-worker dist/bin/
+          cp scripts/fetch-model.sh dist/bin/
+          tar -C dist -czf rsd-macos-arm64.tar.gz bin RSD.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rsd-macos-arm64
+          path: rsd-macos-arm64.tar.gz
+      - name: GitHub Release (tags)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" rsd-macos-arm64.tar.gz --generate-notes
