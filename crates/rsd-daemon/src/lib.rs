@@ -248,14 +248,24 @@ pub fn open_catalog_resilient(
     path: &Path,
     durability: rsd_catalog::Durability,
 ) -> std::io::Result<(Arc<Catalog>, bool)> {
-    match Catalog::open_with_durability(path, durability) {
+    // A torn store can make redb PANIC on open (observed on CI runners) as
+    // well as error — both are the same failure-matrix event: the catalog is
+    // a projection; drop it and let recovery replay it from the journal.
+    let attempt = |path: &Path| -> Result<Catalog, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Catalog::open_with_durability(path, durability)
+        }))
+        .map_err(|_| "redb panicked opening the store".to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))
+    };
+    match attempt(path) {
         Ok(c) => Ok((Arc::new(c), false)),
         Err(first_err) => {
             tracing::warn!(
                 "catalog at {path:?} unopenable ({first_err}); rebuilding projection from journal"
             );
             std::fs::remove_file(path)?;
-            let c = Catalog::open_with_durability(path, durability)
+            let c = attempt(path)
                 .map_err(|e| std::io::Error::other(format!("catalog recreate: {e}")))?;
             Ok((Arc::new(c), true))
         }
