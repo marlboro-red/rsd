@@ -1,11 +1,16 @@
-//! Scan-based reconciliation (P1.3) and the work applier.
+//! Scan-based reconciliation (P1.3) and work resolution.
 //!
-//! `rescan` is the convergence authority: readdir-diff of a scope against the
-//! catalog, batched into single catalog transactions per directory. `apply_work`
-//! resolves coalescer output by lstat.
+//! Phase-2 split (DESIGN.md §7.3): `resolve_work` READS filesystem + catalog and
+//! produces absolute `Change` records; it never writes. The committer journals
+//! those records, then applies them to the catalog as a projection. The phase-1
+//! direct path (`apply_work`, `rescan`, `bootstrap`) is the same resolution
+//! followed by an unjournaled apply — one logic path, two durability modes.
+//!
+//! Subtree removals are expanded to per-path records at resolve time so every
+//! journal record is absolute and replay is shape-independent (§6.1).
 
 use crate::Result;
-use rsd_catalog::{Catalog, ObjectKind, StatInfo};
+use rsd_catalog::{Catalog, Change, ObjectKind, StatInfo};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,6 +31,15 @@ impl ScanStats {
         self.lstats += other.lstats;
         self.upserts += other.upserts;
         self.removals += other.removals;
+    }
+
+    fn count_changes(&mut self, changes: &[Change]) {
+        for ch in changes {
+            match ch {
+                Change::Upsert { .. } => self.upserts += 1,
+                Change::RemovePath { .. } => self.removals += 1,
+            }
+        }
     }
 }
 
@@ -54,45 +68,50 @@ fn is_not_found(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::NotFound
 }
 
-/// Remove a path from the catalog, as a subtree if it was a directory.
-fn remove_cataloged(cat: &Catalog, path: &str, stats: &mut ScanStats) -> Result<()> {
+/// Emit removals for a cataloged path — expanded per-path if it's a directory.
+fn resolve_removal(cat: &Catalog, path: &str, out: &mut Vec<Change>) -> Result<()> {
     match cat.get_by_path(path)? {
         Some((_, rec)) if rec.kind == ObjectKind::Dir => {
-            stats.removals += cat.remove_subtree(path)? as u64;
+            for p in cat.subtree_paths(path)? {
+                out.push(Change::RemovePath { path: p });
+            }
         }
-        Some(_) if cat.remove_path(path)? => {
-            stats.removals += 1;
-        }
-        Some(_) => {}
+        Some(_) => out.push(Change::RemovePath {
+            path: path.to_string(),
+        }),
         None => {}
     }
     Ok(())
 }
 
-/// Reconcile one directory level: lstat + upsert every fs child, remove every
-/// cataloged child no longer present, optionally recurse into child dirs.
-fn scan_dir(cat: &Catalog, dir: &Path, recursive: bool, stats: &mut ScanStats) -> Result<()> {
-    let mut fs_children: Vec<(String, StatInfo)> = Vec::new();
-    let mut child_dirs: Vec<PathBuf> = Vec::new();
-
+/// Reconcile one directory level into `out`: upsert every fs child, remove
+/// every cataloged child no longer present, optionally recurse.
+fn resolve_dir(
+    cat: &Catalog,
+    dir: &Path,
+    recursive: bool,
+    out: &mut Vec<Change>,
+    stats: &mut ScanStats,
+) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if is_not_found(&e) => {
-            remove_cataloged(cat, &path_str(dir), stats)?;
-            return Ok(());
+            return resolve_removal(cat, &path_str(dir), out);
         }
         Err(e) => return Err(e.into()),
     };
     stats.dirs_read += 1;
 
+    let mut live: Vec<String> = Vec::new();
+    let mut child_dirs: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
         stats.lstats += 1;
         let md = match fs::symlink_metadata(&path) {
             Ok(md) => md,
-            // Raced away between readdir and lstat: it simply isn't in
-            // fs_children, so the diff below removes it if cataloged.
+            // Raced away between readdir and lstat: absent from `live`, so the
+            // diff below removes it if cataloged.
             Err(e) if is_not_found(&e) => continue,
             Err(e) => return Err(e.into()),
         };
@@ -100,94 +119,121 @@ fn scan_dir(cat: &Catalog, dir: &Path, recursive: bool, stats: &mut ScanStats) -
         if st.kind == ObjectKind::Dir {
             child_dirs.push(path.clone());
         }
-        fs_children.push((path_str(&path), st));
+        let pstr = path_str(&path);
+        live.push(pstr.clone());
+        out.push(Change::Upsert {
+            path: pstr,
+            stat: st,
+        });
     }
 
-    stats.upserts += fs_children.len() as u64;
-    cat.apply_stats(&fs_children)?;
-
-    // Remove cataloged children that no longer exist on disk.
-    let live: std::collections::HashSet<&str> =
-        fs_children.iter().map(|(p, _)| p.as_str()).collect();
+    // Cataloged children that no longer exist on disk.
+    let live_set: std::collections::HashSet<&str> = live.iter().map(String::as_str).collect();
     for cataloged in cat.children(&path_str(dir))? {
-        if !live.contains(cataloged.as_str()) {
-            remove_cataloged(cat, &cataloged, stats)?;
+        if !live_set.contains(cataloged.as_str()) {
+            resolve_removal(cat, &cataloged, out)?;
         }
     }
 
     if recursive {
         for d in child_dirs {
-            scan_dir(cat, &d, true, stats)?;
+            resolve_dir(cat, &d, true, out, stats)?;
         }
     }
     Ok(())
 }
 
-/// Reconcile `path` against the filesystem: the path itself, plus its children
-/// (one level, or the whole subtree when `recursive`).
-pub fn rescan(cat: &Catalog, path: &Path, recursive: bool) -> Result<ScanStats> {
-    let mut stats = ScanStats::default();
+fn resolve_rescan(
+    cat: &Catalog,
+    path: &Path,
+    recursive: bool,
+    out: &mut Vec<Change>,
+    stats: &mut ScanStats,
+) -> Result<()> {
     stats.lstats += 1;
     match fs::symlink_metadata(path) {
-        Err(e) if is_not_found(&e) => {
-            remove_cataloged(cat, &path_str(path), &mut stats)?;
-        }
-        Err(e) => return Err(e.into()),
+        Err(e) if is_not_found(&e) => resolve_removal(cat, &path_str(path), out),
+        Err(e) => Err(e.into()),
         Ok(md) => {
             let st = StatInfo::from_metadata(&md);
-            cat.apply_stat(&path_str(path), &st)?;
-            stats.upserts += 1;
+            out.push(Change::Upsert {
+                path: path_str(path),
+                stat: st,
+            });
             if st.kind == ObjectKind::Dir {
-                scan_dir(cat, path, recursive, &mut stats)?;
+                resolve_dir(cat, path, recursive, out, stats)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Resolve one work item into absolute changes. Pure read path: lstat decides
+/// everything; the item is only a hint about *where* to look.
+pub fn resolve_work(cat: &Catalog, item: &WorkItem) -> Result<(Vec<Change>, ScanStats)> {
+    let mut out = Vec::new();
+    let mut stats = ScanStats::default();
+    match item.kind {
+        WorkKind::RescanShallow => resolve_rescan(cat, &item.path, false, &mut out, &mut stats)?,
+        WorkKind::RescanRecursive => resolve_rescan(cat, &item.path, true, &mut out, &mut stats)?,
+        WorkKind::Probe => {
+            let pstr = path_str(&item.path);
+            stats.lstats += 1;
+            match fs::symlink_metadata(&item.path) {
+                Err(e) if is_not_found(&e) => resolve_removal(cat, &pstr, &mut out)?,
+                Err(e) => return Err(e.into()),
+                Ok(md) => {
+                    let st = StatInfo::from_metadata(&md);
+                    if st.kind != ObjectKind::Dir {
+                        out.push(Change::Upsert {
+                            path: pstr,
+                            stat: st,
+                        });
+                    } else {
+                        // Directories escalate:
+                        //  - unknown dir (created or moved in): its children got
+                        //    no events of their own => recursive rescan;
+                        //  - known dir: shallow rescan to absorb coalesced child
+                        //    churn cheaply.
+                        let known = matches!(
+                            cat.get_by_path(&pstr)?,
+                            Some((_, rec)) if rec.kind == ObjectKind::Dir
+                                && rec.file_id == st.file_id
+                        );
+                        resolve_rescan(cat, &item.path, !known, &mut out, &mut stats)?;
+                    }
+                }
             }
         }
     }
+    stats.count_changes(&out);
+    Ok((out, stats))
+}
+
+/// Resolve + apply directly (unjournaled): phase-1 path and tooling.
+pub fn apply_work(cat: &Catalog, item: &WorkItem) -> Result<ScanStats> {
+    let (changes, stats) = resolve_work(cat, item)?;
+    cat.apply_changes_direct(&changes)?;
     Ok(stats)
+}
+
+/// Reconcile `path` against the filesystem, applying directly.
+pub fn rescan(cat: &Catalog, path: &Path, recursive: bool) -> Result<ScanStats> {
+    let kind = if recursive {
+        WorkKind::RescanRecursive
+    } else {
+        WorkKind::RescanShallow
+    };
+    apply_work(
+        cat,
+        &WorkItem {
+            path: path.to_path_buf(),
+            kind,
+        },
+    )
 }
 
 /// Full recursive reconciliation of a root — bootstrap and last-resort repair.
 pub fn bootstrap(cat: &Catalog, root: &Path) -> Result<ScanStats> {
     rescan(cat, root, true)
-}
-
-/// Resolve one work item. `lstat` decides everything; the item is only a hint
-/// about *where* to look.
-pub fn apply_work(cat: &Catalog, item: &WorkItem) -> Result<ScanStats> {
-    match item.kind {
-        WorkKind::RescanShallow => rescan(cat, &item.path, false),
-        WorkKind::RescanRecursive => rescan(cat, &item.path, true),
-        WorkKind::Probe => {
-            let mut stats = ScanStats::default();
-            let pstr = path_str(&item.path);
-            stats.lstats += 1;
-            match fs::symlink_metadata(&item.path) {
-                Err(e) if is_not_found(&e) => {
-                    remove_cataloged(cat, &pstr, &mut stats)?;
-                    Ok(stats)
-                }
-                Err(e) => Err(e.into()),
-                Ok(md) => {
-                    let st = StatInfo::from_metadata(&md);
-                    if st.kind != ObjectKind::Dir {
-                        cat.apply_stat(&pstr, &st)?;
-                        stats.upserts += 1;
-                        return Ok(stats);
-                    }
-                    // Directories escalate:
-                    //  - unknown dir (created or moved in): its children got no
-                    //    events of their own => recursive rescan;
-                    //  - known dir: shallow rescan to absorb coalesced child
-                    //    churn cheaply.
-                    let known = matches!(
-                        cat.get_by_path(&pstr)?,
-                        Some((_, rec)) if rec.kind == ObjectKind::Dir
-                            && rec.file_id == st.file_id
-                    );
-                    let mut s = rescan(cat, &item.path, !known)?;
-                    s.lstats += stats.lstats;
-                    Ok(s)
-                }
-            }
-        }
-    }
 }

@@ -1,25 +1,20 @@
 [package]
-name = "rsd-daemon"
+name = "rsd-log"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-default-run = "rsd-daemon"
 
 [lints]
 workspace = true
 
 [dependencies]
 rsd-catalog = { workspace = true }
-rsd-ingest = { workspace = true }
-rsd-fsevents = { workspace = true }
-rsd-log = { workspace = true }
-redb = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
-rsd-testkit = { workspace = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }

@@ -4,6 +4,8 @@ members = [
     "crates/rsd-catalog",
     "crates/rsd-ingest",
     "crates/rsd-fsevents",
+    "crates/rsd-log",
+    "crates/rsd-caes",
     "crates/rsd-testkit",
     "crates/rsd-daemon",
 ]
@@ -18,7 +20,11 @@ rust-version = "1.85"
 rsd-catalog = { path = "crates/rsd-catalog" }
 rsd-ingest = { path = "crates/rsd-ingest" }
 rsd-fsevents = { path = "crates/rsd-fsevents" }
+rsd-log = { path = "crates/rsd-log" }
+rsd-caes = { path = "crates/rsd-caes" }
 rsd-testkit = { path = "crates/rsd-testkit" }
+
+blake3 = "1"
 
 redb = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }

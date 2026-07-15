@@ -359,6 +359,12 @@ impl Watcher {
         self.overflow.store(false, Ordering::Relaxed);
     }
 
+    /// Shared handle to the overflow flag, for consumers that recover on their
+    /// own thread (swap-and-rescan).
+    pub fn overflow_handle(&self) -> Arc<AtomicBool> {
+        self.overflow.clone()
+    }
+
     /// Total events the OS delivered to the callback (observability/tests).
     pub fn delivered(&self) -> u64 {
         self.delivered.load(Ordering::Relaxed)

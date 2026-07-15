@@ -77,7 +77,7 @@ impl FileId {
 }
 
 /// Result of an lstat, the only evidence `apply_stat` accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatInfo {
     pub kind: ObjectKind,
     pub file_id: FileId,
@@ -155,9 +155,41 @@ impl Applied {
     }
 }
 
+/// An absolute, self-contained catalog transition — the journal payload
+/// (DESIGN.md §6.1). Deliberately *not* relative or subtree-shaped: replaying a
+/// `Change` must produce the same effect regardless of catalog shape at replay
+/// time, so subtree removals are expanded to per-path records at resolve time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Change {
+    Upsert { path: String, stat: StatInfo },
+    RemovePath { path: String },
+}
+
+impl Change {
+    pub fn path(&self) -> &str {
+        match self {
+            Change::Upsert { path, .. } | Change::RemovePath { path } => path,
+        }
+    }
+}
+
+const APPLIED_LSN: &str = "applied_lsn";
+
 pub struct Catalog {
     db: Database,
     durability: redb::Durability,
+}
+
+fn apply_change_in(t: &mut Tables<'_>, ch: &Change, now_ns: u64) -> Result<()> {
+    match ch {
+        Change::Upsert { path, stat } => {
+            apply_stat_in(t, path, stat, now_ns)?;
+        }
+        Change::RemovePath { path } => {
+            remove_path_in(t, path, now_ns)?;
+        }
+    }
+    Ok(())
 }
 
 struct Tables<'txn> {
@@ -373,6 +405,61 @@ impl Catalog {
                 }
             }
             Ok(n)
+        })
+    }
+
+    /// The catalog's projection watermark: the highest journal LSN whose effect
+    /// is durably reflected here. 0 means "nothing applied".
+    pub fn applied_lsn(&self) -> Result<u64> {
+        let txn = self.db.begin_read()?;
+        let meta = txn.open_table(META)?;
+        Ok(meta.get(APPLIED_LSN)?.map(|g| g.value()).unwrap_or(0))
+    }
+
+    /// Apply journaled changes with exactly-once watermark discipline: the batch
+    /// lands in ONE transaction together with the watermark advance, so a crash
+    /// either applies all of `changes` or none — and replaying an already-applied
+    /// batch (lsn <= watermark) is a no-op. `first_lsn` is the LSN of
+    /// `changes[0]`; the batch must be LSN-contiguous (journal appends are).
+    ///
+    /// Returns the number of changes actually applied (skipped ones were already
+    /// covered by the watermark).
+    pub fn apply_changes(&self, first_lsn: u64, changes: &[Change]) -> Result<u64> {
+        if changes.is_empty() {
+            return Ok(0);
+        }
+        self.with_write(|t| {
+            let applied = t.meta.get(APPLIED_LSN)?.map(|g| g.value()).unwrap_or(0);
+            let now = now_ns();
+            let mut n = 0u64;
+            for (i, ch) in changes.iter().enumerate() {
+                let lsn = first_lsn + i as u64;
+                if lsn <= applied {
+                    continue;
+                }
+                apply_change_in(t, ch, now)?;
+                n += 1;
+            }
+            let last = first_lsn + changes.len() as u64 - 1;
+            if last > applied {
+                t.meta.insert(APPLIED_LSN, last)?;
+            }
+            Ok(n)
+        })
+    }
+
+    /// Apply changes without watermark bookkeeping (phase-1 direct path and
+    /// tooling). One transaction for the whole batch.
+    pub fn apply_changes_direct(&self, changes: &[Change]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        self.with_write(|t| {
+            let now = now_ns();
+            for ch in changes {
+                apply_change_in(t, ch, now)?;
+            }
+            Ok(())
         })
     }
 

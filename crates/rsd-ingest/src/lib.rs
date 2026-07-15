@@ -8,7 +8,7 @@ pub mod coalesce;
 pub mod scan;
 
 pub use coalesce::{Coalescer, CoalescerConfig, IngestEvent};
-pub use scan::{apply_work, bootstrap, rescan, ScanStats, WorkItem, WorkKind};
+pub use scan::{apply_work, bootstrap, rescan, resolve_work, ScanStats, WorkItem, WorkKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {

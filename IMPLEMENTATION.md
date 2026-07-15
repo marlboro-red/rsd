@@ -84,26 +84,30 @@ extraction, no query engine yet — correctness of observation only.
 
 ## Phase 2 — Journal, CAES, commit state machine (design §6.1–6.2, §7.3–7.4, spike 2)
 
-**P2.1 — Journal (`rsd-log`) [ ]**
+**P2.1 — Journal (`rsd-log`) [x]**
 - Append-only segmented log, per-record blake3 checksum, LSN allocation, segment
   seal with membership manifest, replay iterator, corrupt-record detection.
 - Success: unit tests incl. torn-write simulation (truncate mid-record → clean
   detection, replay stops at last valid record); fuzz decode never panics.
 
-**P2.2 — Source-cursor fencing [ ]**
-- FSEvents `sinceWhen` cursor persisted only after derived records are journaled.
+**P2.2 — Source-cursor fencing [x]**
+- Cursor persisted only after derived records are journaled (CursorStore, atomic
+  tmp+rename, corrupt-reads-as-None so the failure direction is re-delivery).
+- Note: proven end-to-end via the synthetic-source crash harness; wiring the
+  daemon's FSEvents `sinceWhen` resume through the coalescer's pending window is
+  deferred to Phase 3 (startup bootstrap rescan covers correctness meanwhile).
 - Success: kill-restart test — events delivered between journal and cursor-advance
   are re-delivered and idempotently re-applied; zero lost transitions across 100
   randomized kill points.
 
-**P2.3 — CAES v1 [ ]**
+**P2.3 — CAES v1 [x]**
 - Content-addressed store for extraction records (text+attrs placeholder schema),
   keyed `(content_hash, extractor_id+version, hints_hash, abi_version)`; checksums;
   retention stub (unlimited).
 - Success: round-trip, corrupt-record detection, dedup hit on identical content
   under two paths (copy indexes with zero extraction calls — counter-verified).
 
-**P2.4 — Commit state machine + idempotent apply [ ]**
+**P2.4 — Commit state machine + idempotent apply [x]**
 - Single committer: journal-before-apply, CAES-before-planes, per-plane watermarks,
   `(lsn, id, plane, version)` idempotency keys; catalog is the first projection.
 - Success criteria (the crash-injection gate, permanent in CI):
