@@ -14,6 +14,7 @@ rsd-lexical = { workspace = true }
 rsd-query = { workspace = true }
 rsd-ipc = { workspace = true }
 rsd-vector = { workspace = true }
+rsd-ml = { workspace = true }
 rsd-caes = { workspace = true }
 rsd-extract = { workspace = true }
 serde_json = { workspace = true }

@@ -201,7 +201,12 @@ extraction, no query engine yet — correctness of observation only.
 
 ## Phase 6 — Semantic plane (design §6.5, §8.2, spike 5) [T1]
 
-**P6.1 — `rsd-ml` sidecar [~]** (Embedder trait + deterministic hash-projection embedder shipped and wired end-to-end; CoreML/ANE sidecar slots behind the same trait —) — batched embedding protocol, CoreML/ANE path, candle
+**P6.1 — `rsd-ml` learned embedder [x]** — all-MiniLM-L6-v2 via candle behind
+the Embedder trait, mean-pooled + normalized, 6.9ms/chunk CPU; hash-projection
+fallback when the model is absent (scripts/fetch-model.sh). Paraphrase proof:
+zero-shared-vocabulary queries rank correctly. Deferred within P6.1: the
+evictable sidecar *process* (transport change behind the same trait) and the
+ANE/Metal device path (throughput, not capability). — batched embedding protocol, CoreML/ANE path, candle
 fallback, full idle eviction. Success: ≥ 2k chunks/sec (adopt) or documented
 fallback throughput; RSS returns to baseline after idle timeout.
 **P6.2 [x]** — structure-aware chunks, HNSW segments with

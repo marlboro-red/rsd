@@ -86,21 +86,33 @@ fn main() -> std::io::Result<()> {
         }
     };
 
-    // Semantic plane (P6): shipped hash-projection embedder; the CoreML/ANE
-    // sidecar replaces the embedder behind the same trait.
+    // Semantic plane (P6): learned embedder (MiniLM via candle) when the
+    // model is present, hash-projection fallback otherwise. Same trait, same
+    // plane; the VectorPlane skips stale-embedder vectors automatically.
+    let embedder: Arc<dyn rsd_vector::Embedder> = match rsd_ml::MiniLmEmbedder::load(
+        &rsd_ml::MiniLmEmbedder::default_dir(),
+    ) {
+        Ok(m) => {
+            eprintln!("semantic: learned embedder ({})", rsd_ml::MODEL_ID);
+            Arc::new(m)
+        }
+        Err(e) => {
+            eprintln!(
+                    "semantic: hash-projection fallback ({e}; run scripts/fetch-model.sh for the learned model)"
+                );
+            Arc::new(rsd_vector::HashEmbedder::default())
+        }
+    };
     let vector = lexical.as_ref().map(|(_, caes)| {
-        let plane = rsd_vector::VectorPlane::open(
-            &state.join("vector.redb"),
-            Arc::new(rsd_vector::HashEmbedder::default()),
-        )
-        .expect("vector plane");
+        let plane = rsd_vector::VectorPlane::open(&state.join("vector.redb"), embedder.clone())
+            .expect("vector plane");
         (Arc::new(std::sync::Mutex::new(plane)), caes.clone())
     });
     let vector_handle = vector.as_ref().map(|(p, _)| p.clone());
     let caes_for_live = lexical.as_ref().map(|(_, c)| c.clone());
     let live = Arc::new(std::sync::Mutex::new({
         let mut eng = rsd_live::LiveEngine::new(caes_for_live);
-        eng.set_embedder(Arc::new(rsd_vector::HashEmbedder::default()));
+        eng.set_embedder(embedder.clone());
         eng
     }));
 

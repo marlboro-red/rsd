@@ -1,0 +1,19 @@
+[package]
+name = "rsd-ml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No workspace lints: VarBuilder::from_mmaped_safetensors is unsafe (mmap) —
+# the third and final crate permitted unsafe, alongside rsd-fsevents and
+# rsd-sandbox.
+
+[dependencies]
+rsd-vector = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+tokenizers = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

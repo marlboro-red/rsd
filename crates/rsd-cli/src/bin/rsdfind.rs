@@ -105,6 +105,13 @@ fn run_alert(state: &std::path::Path, query: &str, threshold: f32) -> ! {
     }
 }
 
+fn rsd_ml_or_hash() -> std::sync::Arc<dyn rsd_vector::Embedder> {
+    match rsd_ml::MiniLmEmbedder::load(&rsd_ml::MiniLmEmbedder::default_dir()) {
+        Ok(m) => std::sync::Arc::new(m),
+        Err(_) => std::sync::Arc::new(rsd_vector::HashEmbedder::default()),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut state = None;
@@ -188,11 +195,7 @@ fn main() {
             std::process::exit(1);
         });
     let lexical = LexicalReader::open(&state.join("lexical")).ok();
-    let vector = rsd_vector::VectorPlane::open(
-        &state.join("vector.redb"),
-        std::sync::Arc::new(rsd_vector::HashEmbedder::default()),
-    )
-    .ok();
+    let vector = rsd_vector::VectorPlane::open(&state.join("vector.redb"), rsd_ml_or_hash()).ok();
 
     let engine = QueryEngine {
         catalog: &catalog,

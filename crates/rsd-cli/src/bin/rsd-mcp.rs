@@ -11,7 +11,7 @@ use rsd_catalog::{Catalog, Durability};
 use rsd_extract::{EXTRACTOR_ID, EXTRACTOR_VERSION};
 use rsd_lexical::LexicalReader;
 use rsd_query::{parse, QueryEngine};
-use rsd_vector::{HashEmbedder, VectorPlane};
+use rsd_vector::VectorPlane;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
@@ -20,6 +20,13 @@ struct State {
     lexical: Option<LexicalReader>,
     vector: Option<VectorPlane>,
     caes: Option<rsd_caes::Store>,
+}
+
+fn rsd_ml_or_hash() -> std::sync::Arc<dyn rsd_vector::Embedder> {
+    match rsd_ml::MiniLmEmbedder::load(&rsd_ml::MiniLmEmbedder::default_dir()) {
+        Ok(m) => std::sync::Arc::new(m),
+        Err(_) => std::sync::Arc::new(rsd_vector::HashEmbedder::default()),
+    }
 }
 
 fn main() {
@@ -38,11 +45,7 @@ fn main() {
         )
         .expect("catalog"),
         lexical: LexicalReader::open(&state_dir.join("lexical")).ok(),
-        vector: VectorPlane::open(
-            &state_dir.join("vector.redb"),
-            std::sync::Arc::new(HashEmbedder::default()),
-        )
-        .ok(),
+        vector: VectorPlane::open(&state_dir.join("vector.redb"), rsd_ml_or_hash()).ok(),
         caes: rsd_caes::Store::open(&state_dir.join("caes.redb")).ok(),
     };
 
