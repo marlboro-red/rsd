@@ -40,6 +40,7 @@ impl AuthzStore {
 pub struct IpcCtx {
     pub catalog: Arc<Catalog>,
     pub lexical_dir: PathBuf,
+    pub vector: Option<Arc<Mutex<rsd_vector::VectorPlane>>>,
     pub live: Arc<Mutex<LiveEngine>>,
     pub authz: Arc<AuthzStore>,
 }
@@ -194,9 +195,11 @@ fn run_query(
     scope: Option<&str>,
 ) -> Result<Vec<Hit>, String> {
     let expr = parse(rql).map_err(|e| e.to_string())?;
+    let vguard = ctx.vector.as_ref().map(|v| v.lock().unwrap());
     let engine = QueryEngine {
         catalog: &ctx.catalog,
         lexical,
+        vector: vguard.as_deref(),
         limit: 10_000,
     };
     let hits = engine.run(&expr, scope).map_err(|e| e.to_string())?;

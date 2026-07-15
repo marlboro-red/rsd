@@ -13,7 +13,15 @@ rsd-catalog = { workspace = true }
 rsd-lexical = { workspace = true }
 rsd-query = { workspace = true }
 rsd-ipc = { workspace = true }
+rsd-vector = { workspace = true }
+rsd-caes = { workspace = true }
+rsd-extract = { workspace = true }
+serde_json = { workspace = true }
 
 [[bin]]
 name = "rsdfind"
 path = "src/bin/rsdfind.rs"
+
+[[bin]]
+name = "rsd-mcp"
+path = "src/bin/rsd-mcp.rs"

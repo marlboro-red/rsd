@@ -29,6 +29,10 @@ pub struct Committer {
     catalog: Arc<Catalog>,
     journal: Journal,
     lexical: Option<(rsd_lexical::LexicalPlane, Arc<rsd_caes::Store>)>,
+    vector: Option<(
+        Arc<std::sync::Mutex<rsd_vector::VectorPlane>>,
+        Arc<rsd_caes::Store>,
+    )>,
     on_commit: Option<OnCommit>,
 }
 
@@ -38,8 +42,19 @@ impl Committer {
             catalog,
             journal,
             lexical: None,
+            vector: None,
             on_commit: None,
         }
+    }
+
+    /// Attach the semantic plane projection (P6.2).
+    pub fn with_vector(
+        mut self,
+        plane: Arc<std::sync::Mutex<rsd_vector::VectorPlane>>,
+        caes: Arc<rsd_caes::Store>,
+    ) -> Committer {
+        self.vector = Some((plane, caes));
+        self
     }
 
     /// Hook receiving every committed batch's deltas (live-view engine).
@@ -78,6 +93,15 @@ impl Committer {
         if let Some((plane, caes)) = self.lexical.as_mut() {
             if let Err(e) = plane.apply(first, changes, &self.catalog, caes) {
                 tracing::error!("lexical apply failed (plane lags, rebuildable): {e}");
+            }
+        }
+        if let Some((plane, caes)) = self.vector.as_ref() {
+            if let Err(e) = plane
+                .lock()
+                .unwrap()
+                .apply(first, changes, &self.catalog, caes)
+            {
+                tracing::error!("vector apply failed (plane lags, rebuildable): {e}");
             }
         }
         if let Some(hook) = self.on_commit.as_mut() {

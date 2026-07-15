@@ -74,6 +74,8 @@ fn main() {
     let mut nul = false;
     let mut explain = false;
     let mut live = false;
+    let mut semantic = false;
+    let mut hybrid = false;
     let mut query_parts: Vec<String> = Vec::new();
 
     let mut it = args.into_iter();
@@ -85,6 +87,8 @@ fn main() {
             "-name" => name_pat = it.next(),
             "-0" => nul = true,
             "-live" => live = true,
+            "--semantic" => semantic = true,
+            "--hybrid" => hybrid = true,
             "--explain" => explain = true,
             _ => query_parts.push(a),
         }
@@ -105,7 +109,11 @@ fn main() {
     }
     let text = query_parts.join(" ");
     if !text.is_empty() {
-        clauses.push(text);
+        if semantic {
+            clauses.push(format!(r#"semantic("{text}")"#));
+        } else {
+            clauses.push(text);
+        }
     }
     if clauses.is_empty() {
         usage();
@@ -130,12 +138,39 @@ fn main() {
             std::process::exit(1);
         });
     let lexical = LexicalReader::open(&state.join("lexical")).ok();
+    let vector = rsd_vector::VectorPlane::open(
+        &state.join("vector.redb"),
+        std::sync::Arc::new(rsd_vector::HashEmbedder::default()),
+    )
+    .ok();
 
     let engine = QueryEngine {
         catalog: &catalog,
         lexical: lexical.as_ref(),
+        vector: vector.as_ref(),
         limit: 10_000,
     };
+    if hybrid {
+        let text = query_parts.join(" ");
+        match engine.hybrid(&text, 100) {
+            Ok(hits) => {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                if count {
+                    let _ = writeln!(out, "{}", hits.len());
+                } else {
+                    for h in hits {
+                        let _ = writeln!(out, "{}", h.path);
+                    }
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!("rsdfind: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if explain {
         eprintln!("plan: {:?}", engine.plan(&expr));
     }

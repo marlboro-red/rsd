@@ -80,6 +80,7 @@ fn live_storm_converges_with_zero_full_rescans() {
         None,
         None,
         None,
+        None,
         fast_cfg(),
     )
     .unwrap();
@@ -115,6 +116,7 @@ fn overflow_self_heals_with_counted_root_rescan() {
         None,
         None,
         None,
+        None,
         cfg,
     )
     .unwrap();
@@ -146,6 +148,7 @@ fn rename_storm_preserves_object_identity() {
         env.cat.clone(),
         &env.journal_dir,
         &env.root,
+        None,
         None,
         None,
         None,
@@ -201,6 +204,7 @@ fn dir_move_in_and_out_converges() {
         env.cat.clone(),
         &env.journal_dir,
         &env.root,
+        None,
         None,
         None,
         None,

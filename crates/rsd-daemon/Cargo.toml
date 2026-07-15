@@ -18,6 +18,7 @@ rsd-extract = { workspace = true }
 rsd-worker = { workspace = true }
 rsd-lexical = { workspace = true }
 rsd-live = { workspace = true }
+rsd-vector = { workspace = true }
 rsd-ipc = { workspace = true }
 rsd-query = { workspace = true }
 nix = { workspace = true }

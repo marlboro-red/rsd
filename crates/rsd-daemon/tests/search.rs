@@ -94,6 +94,7 @@ fn setup() -> Env {
         Some(indexer),
         Some((plane, caes.clone())),
         None,
+        None,
         fast_cfg(),
     )
     .unwrap();
@@ -114,6 +115,7 @@ fn query(env: &Env, rql: &str, scope: Option<&str>) -> Vec<String> {
     let engine = QueryEngine {
         catalog: &env.cat,
         lexical: Some(&plane),
+        vector: None,
         limit: 1000,
     };
     let expr = parse(rql).unwrap();
@@ -176,6 +178,7 @@ fn text_symbol_attr_and_mixed_queries_answer() {
     let engine = QueryEngine {
         catalog: &env.cat,
         lexical: Some(&plane),
+        vector: None,
         limit: 10,
     };
     assert_eq!(
@@ -250,6 +253,7 @@ fn lexical_plane_rebuilds_from_caes_with_zero_extractions() {
         let engine = QueryEngine {
             catalog: &env.cat,
             lexical: Some(&plane),
+            vector: None,
             limit: 100,
         };
         engine.run(&parse(r#""dilithium""#).unwrap(), None).unwrap()

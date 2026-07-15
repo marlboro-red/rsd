@@ -96,7 +96,7 @@ fn crash_kills_one_request_and_pool_self_heals() {
 
 #[test]
 fn hang_hits_timeout_and_pool_self_heals() {
-    let mut p = pool(|c| c.request_timeout = Duration::from_millis(300));
+    let mut p = pool(|c| c.request_timeout = Duration::from_millis(1500));
     let err = p.request(&WorkerRequest::HangSelf, None).unwrap_err();
     assert!(matches!(err, WorkerError::Timeout), "got {err:?}");
     assert_eq!(p.respawns, 1);

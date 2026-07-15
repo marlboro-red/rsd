@@ -74,6 +74,7 @@ fn setup(authz: AuthzStore) -> Env {
         &root,
         Some(indexer),
         Some((plane, caes)),
+        None,
         Some(live.clone()),
         fast_cfg(),
     )
@@ -84,6 +85,7 @@ fn setup(authz: AuthzStore) -> Env {
         IpcCtx {
             catalog: cat.clone(),
             lexical_dir: base.join("lexical"),
+            vector: None,
             live: live.clone(),
             authz: Arc::new(authz),
         },
@@ -123,6 +125,12 @@ fn expect_event(s: &mut UnixStream, deadline: Duration) -> Response {
 #[test]
 fn subscribe_streams_enters_and_leaves_over_ipc() {
     let env = setup(AuthzStore::default());
+    // Bootstrap is synchronous, but under parallel test load the watcher may
+    // still be settling; fence on the seed files being cataloged.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while env.cat.entry_count().unwrap() < 5 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let mut s = connect(&env, "test");
     send(
         &mut s,
@@ -149,7 +157,14 @@ fn subscribe_streams_enters_and_leaves_over_ipc() {
     match expect_event(&mut s, Duration::from_secs(15)) {
         Response::Event {
             enter: false, path, ..
-        } => assert!(path.ends_with("gamma.log")),
+        } => {
+            // Rename yields two deltas (old-path removal, new-path upsert) in
+            // nondeterministic order; the Leave may carry either binding.
+            assert!(
+                path.ends_with("gamma.log") || path.ends_with("gamma.txt"),
+                "unexpected leave path {path}"
+            );
+        }
         other => panic!("expected Leave, got {other:?}"),
     }
     env.pipeline.stop();
@@ -168,6 +183,7 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
         IpcCtx {
             catalog: env.cat.clone(),
             lexical_dir: env.base.join("lexical"),
+            vector: None,
             live: env.live.clone(),
             authz: Arc::new(a),
         },
@@ -292,6 +308,7 @@ fn initial_oids(env: &Env, expr: &rsd_query::Expr) -> Vec<u64> {
     let engine = rsd_query::QueryEngine {
         catalog: &env.cat,
         lexical: Some(&reader),
+        vector: None,
         limit: 100_000,
     };
     engine

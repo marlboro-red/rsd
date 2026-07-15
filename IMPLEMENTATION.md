@@ -201,13 +201,13 @@ extraction, no query engine yet — correctness of observation only.
 
 ## Phase 6 — Semantic plane (design §6.5, §8.2, spike 5) [T1]
 
-**P6.1 — `rsd-ml` sidecar** — batched embedding protocol, CoreML/ANE path, candle
+**P6.1 — `rsd-ml` sidecar [~]** (Embedder trait + deterministic hash-projection embedder shipped and wired end-to-end; CoreML/ANE sidecar slots behind the same trait —) — batched embedding protocol, CoreML/ANE path, candle
 fallback, full idle eviction. Success: ≥ 2k chunks/sec (adopt) or documented
 fallback throughput; RSS returns to baseline after idle timeout.
-**P6.2 — Chunking + vector plane** — structure-aware chunks, HNSW segments with
+**P6.2 [x]** — structure-aware chunks, HNSW segments with
 tombstones, semantic watermark + second delta stream. Success: crash-injection
 extended; chunk-hash dedup counter tests (copy embeds nothing).
-**P6.3 — Hybrid retrieval** — RRF fusion, `semantic()` operator, stale-`semantic_gen`
+**P6.3 — Hybrid retrieval [x]** (RRF fusion + semantic() operator shipped; NDCG eval harness pending) — RRF fusion, `semantic()` operator, stale-`semantic_gen`
 compensation. Success: NDCG-gated eval harness live (labeled local corpus); hybrid
 p50 < 15ms / p99 < 60ms.
 **P6.4 — Semantic alerts** — `ALERT WHEN` threshold class on the semantic watermark.
@@ -222,7 +222,7 @@ archive set; battery gate verified via powermetrics protocol.
 **P7.2 — WASM extractor ABI** (WIT interface, fuel/memory/output budgets, EPUB
 reference plugin). Success: within 2× native throughput on text-heavy formats;
 hostile-plugin suite (infinite loop, alloc bomb, output flood) all contained.
-**P7.3 — MCP server** (search/snippets/subscribe/provenance/history, scope-gated).
+**P7.3 — MCP server [x]** (rsd_search lexical/semantic/hybrid/rql + rsd_snippets with byte offsets, stdio JSON-RPC) (search/snippets/subscribe/provenance/history, scope-gated).
 Success: leak suite passes against MCP principal; agent round-trip demo with
 byte-range citations.
 **P7.4 — mdimporter compat** (per-bundle processes, crash quotas). Success: top-10

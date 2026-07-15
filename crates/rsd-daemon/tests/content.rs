@@ -89,6 +89,7 @@ fn setup(files: usize) -> Env {
         Some(indexer),
         None,
         None,
+        None,
         fast_cfg(),
     )
     .unwrap();

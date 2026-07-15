@@ -278,12 +278,17 @@ fn file_upserts(changes: &[rsd_catalog::Change]) -> Vec<(String, rsd_catalog::St
 
 /// The standard bring-up sequence: open journal → recover projection →
 /// journaled bootstrap reconciliation (content-indexed) → live pipeline.
+#[allow(clippy::too_many_arguments)] // bring-up wires every plane once; a builder adds ceremony without safety
 pub fn bring_up(
     catalog: Arc<Catalog>,
     journal_dir: &Path,
     root: &Path,
     mut content: Option<ContentIndexer>,
     lexical: Option<(rsd_lexical::LexicalPlane, Arc<rsd_caes::Store>)>,
+    vector: Option<(
+        Arc<std::sync::Mutex<rsd_vector::VectorPlane>>,
+        Arc<rsd_caes::Store>,
+    )>,
     live: Option<Arc<std::sync::Mutex<rsd_live::LiveEngine>>>,
     cfg: PipelineConfig,
 ) -> std::io::Result<(Pipeline, ScanStats)> {
@@ -298,6 +303,9 @@ pub fn bring_up(
     let mut committer = Committer::new(catalog.clone(), journal);
     if let Some((plane, caes)) = lexical {
         committer = committer.with_lexical(plane, caes);
+    }
+    if let Some((plane, caes)) = vector {
+        committer = committer.with_vector(plane, caes);
     }
     if let Some(live) = live {
         committer.set_on_commit(Box::new(move |deltas| {

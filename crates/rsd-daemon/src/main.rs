@@ -86,6 +86,17 @@ fn main() -> std::io::Result<()> {
         }
     };
 
+    // Semantic plane (P6): shipped hash-projection embedder; the CoreML/ANE
+    // sidecar replaces the embedder behind the same trait.
+    let vector = lexical.as_ref().map(|(_, caes)| {
+        let plane = rsd_vector::VectorPlane::open(
+            &state.join("vector.redb"),
+            Arc::new(rsd_vector::HashEmbedder::default()),
+        )
+        .expect("vector plane");
+        (Arc::new(std::sync::Mutex::new(plane)), caes.clone())
+    });
+    let vector_handle = vector.as_ref().map(|(p, _)| p.clone());
     let caes_for_live = lexical.as_ref().map(|(_, c)| c.clone());
     let live = Arc::new(std::sync::Mutex::new(rsd_live::LiveEngine::new(
         caes_for_live,
@@ -99,6 +110,7 @@ fn main() -> std::io::Result<()> {
         &root,
         content,
         lexical,
+        vector,
         Some(live.clone()),
         PipelineConfig::default(),
     )?;
@@ -107,6 +119,7 @@ fn main() -> std::io::Result<()> {
         rsd_daemon::ipc::IpcCtx {
             catalog: catalog.clone(),
             lexical_dir: state.join("lexical"),
+            vector: vector_handle,
             live,
             authz: Arc::new(rsd_daemon::ipc::AuthzStore::default()),
         },

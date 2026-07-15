@@ -932,10 +932,14 @@ dependencies = [
 name = "rsd-cli"
 version = "0.1.0"
 dependencies = [
+ "rsd-caes",
  "rsd-catalog",
+ "rsd-extract",
  "rsd-ipc",
  "rsd-lexical",
  "rsd-query",
+ "rsd-vector",
+ "serde_json",
 ]
 
 [[package]]
@@ -958,6 +962,7 @@ dependencies = [
  "rsd-log",
  "rsd-query",
  "rsd-testkit",
+ "rsd-vector",
  "rsd-worker",
  "tempfile",
  "thiserror",
@@ -1061,6 +1066,7 @@ version = "0.1.0"
 dependencies = [
  "rsd-catalog",
  "rsd-lexical",
+ "rsd-vector",
  "tempfile",
  "thiserror",
 ]
@@ -1076,6 +1082,21 @@ dependencies = [
  "rand",
  "rand_chacha",
  "rsd-catalog",
+]
+
+[[package]]
+name = "rsd-vector"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "redb",
+ "rsd-caes",
+ "rsd-catalog",
+ "rsd-extract",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

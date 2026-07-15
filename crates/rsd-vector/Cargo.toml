@@ -1,5 +1,5 @@
 [package]
-name = "rsd-query"
+name = "rsd-vector"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,9 +9,13 @@ workspace = true
 
 [dependencies]
 rsd-catalog = { workspace = true }
-rsd-lexical = { workspace = true }
-rsd-vector = { workspace = true }
+rsd-caes = { workspace = true }
+rsd-extract = { workspace = true }
+redb = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

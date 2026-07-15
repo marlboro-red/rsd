@@ -36,6 +36,8 @@ pub enum QueryError {
     Lexical(#[from] rsd_lexical::LexicalError),
     #[error("query needs a lexical plane (text predicate) but none is open")]
     NoLexicalPlane,
+    #[error("query needs a vector plane (semantic predicate) but none is open")]
+    NoVectorPlane,
 }
 
 pub type Result<T> = std::result::Result<T, QueryError>;
@@ -105,6 +107,10 @@ pub enum Expr {
     /// Bare full-text content search.
     Text {
         terms: String,
+    },
+    /// Semantic similarity search (rsd extension, P6.3).
+    Semantic {
+        query: String,
     },
 }
 
@@ -212,6 +218,18 @@ impl<'a> Parser<'a> {
         let Some(word) = self.ident() else {
             return self.err("expected predicate");
         };
+        if word == "semantic" {
+            if !self.eat("(") {
+                return self.err("expected '(' after semantic");
+            }
+            let Value::Str { text, .. } = self.parse_string()? else {
+                return self.err("expected string");
+            };
+            if !self.eat(")") {
+                return self.err("expected ')'");
+            }
+            return Ok(Expr::Semantic { query: text });
+        }
         if word == "InRange" {
             if !self.eat("(") {
                 return self.err("expected '(' after InRange");
@@ -397,6 +415,7 @@ fn glob_match(pattern: &str, text: &str, ci: bool) -> bool {
 pub struct QueryEngine<'a> {
     pub catalog: &'a Catalog,
     pub lexical: Option<&'a LexicalReader>,
+    pub vector: Option<&'a rsd_vector::VectorPlane>,
     pub limit: usize,
 }
 
@@ -427,6 +446,25 @@ impl<'a> QueryEngine<'a> {
     }
 
     pub fn run(&self, expr: &Expr, scope: Option<&str>) -> Result<Vec<Hit>> {
+        // Fast path: pure semantic query => vector plane, rank order kept.
+        if let (Expr::Semantic { query }, None) = (expr, scope) {
+            let vp = self.vector.ok_or(QueryError::NoVectorPlane)?;
+            let hits = vp
+                .search(query, self.limit)
+                .map_err(|e| QueryError::Unsupported(e.to_string()))?;
+            let mut out = Vec::with_capacity(hits.len());
+            for h in hits {
+                if let Some(rec) = self.catalog.get_object(h.oid)? {
+                    if let Some(p) = rec.entry_paths.first() {
+                        out.push(Hit {
+                            oid: h.oid,
+                            path: p.clone(),
+                        });
+                    }
+                }
+            }
+            return Ok(out);
+        }
         // Fast path: pure text query, no scope => lexical plane directly.
         if let (Expr::Text { terms }, None) = (expr, scope) {
             let lex = self.lexical.ok_or(QueryError::NoLexicalPlane)?;
@@ -450,7 +488,7 @@ impl<'a> QueryEngine<'a> {
         // General path: pre-resolve every text predicate to an oid set, then
         // scan the (scoped) catalog evaluating the expression per entry.
         let mut sets: Vec<HashSet<u64>> = Vec::new();
-        collect_text_sets(expr, self.lexical, self.limit, &mut sets)?;
+        collect_text_sets(expr, self.lexical, self.vector, self.limit, &mut sets)?;
         let mut sets_iter = sets.into_iter();
         let expr = bind_text_sets(expr, &mut sets_iter);
 
@@ -482,7 +520,7 @@ fn count_text(e: &Expr) -> usize {
     match e {
         Expr::And(v) | Expr::Or(v) => v.iter().map(count_text).sum(),
         Expr::Not(b) => count_text(b),
-        Expr::Text { .. } => 1,
+        Expr::Text { .. } | Expr::Semantic { .. } => 1,
         Expr::Cmp {
             attr: Attr::TextContent | Attr::Symbols,
             ..
@@ -505,21 +543,32 @@ enum Bound {
 fn collect_text_sets(
     e: &Expr,
     lex: Option<&LexicalReader>,
+    vector: Option<&rsd_vector::VectorPlane>,
     limit: usize,
     out: &mut Vec<HashSet<u64>>,
 ) -> Result<()> {
     match e {
         Expr::And(v) | Expr::Or(v) => {
             for x in v {
-                collect_text_sets(x, lex, limit, out)?;
+                collect_text_sets(x, lex, vector, limit, out)?;
             }
         }
-        Expr::Not(b) => collect_text_sets(b, lex, limit, out)?,
+        Expr::Not(b) => collect_text_sets(b, lex, vector, limit, out)?,
         Expr::Text { terms } => {
             let lex = lex.ok_or(QueryError::NoLexicalPlane)?;
             out.push(
                 lex.search_content(terms, false, limit.max(65_536))?
                     .into_iter()
+                    .collect(),
+            );
+        }
+        Expr::Semantic { query } => {
+            let vp = vector.ok_or(QueryError::NoVectorPlane)?;
+            out.push(
+                vp.search(query, limit.max(256))
+                    .map_err(|e| QueryError::Unsupported(e.to_string()))?
+                    .into_iter()
+                    .map(|h| h.oid)
                     .collect(),
             );
         }
@@ -557,7 +606,9 @@ fn bind_text_sets(e: &Expr, sets: &mut impl Iterator<Item = HashSet<u64>>) -> Bo
         Expr::And(v) => Bound::And(v.iter().map(|x| bind_text_sets(x, sets)).collect()),
         Expr::Or(v) => Bound::Or(v.iter().map(|x| bind_text_sets(x, sets)).collect()),
         Expr::Not(b) => Bound::Not(Box::new(bind_text_sets(b, sets))),
-        Expr::Text { .. } => Bound::TextSet(sets.next().unwrap_or_default()),
+        Expr::Text { .. } | Expr::Semantic { .. } => {
+            Bound::TextSet(sets.next().unwrap_or_default())
+        }
         Expr::Cmp {
             attr: Attr::TextContent | Attr::Symbols,
             ..
@@ -654,6 +705,7 @@ pub fn eval_live(
         Expr::Or(v) => v.iter().any(|x| eval_live(x, path, rec, text_match)),
         Expr::Not(b) => !eval_live(b, path, rec, text_match),
         Expr::Text { terms } => text_match(terms, false),
+        Expr::Semantic { .. } => false, // live semantic alerts route via LiveEngine's vector hook
         Expr::Cmp {
             attr: Attr::TextContent,
             value: Value::Str { text, .. },
@@ -691,6 +743,34 @@ pub fn eval_live(
             Some(v) => value_num(lo) <= v && v <= value_num(hi),
             None => false,
         },
+    }
+}
+
+impl<'a> QueryEngine<'a> {
+    /// Hybrid retrieval (P6.3): RRF fusion of lexical and semantic top-k.
+    pub fn hybrid(&self, text: &str, k: usize) -> Result<Vec<Hit>> {
+        let lex = self.lexical.ok_or(QueryError::NoLexicalPlane)?;
+        let vp = self.vector.ok_or(QueryError::NoVectorPlane)?;
+        let lexical = lex.search_content(text, false, k.max(50))?;
+        let semantic: Vec<u64> = vp
+            .search(text, k.max(50))
+            .map_err(|e| QueryError::Unsupported(e.to_string()))?
+            .into_iter()
+            .map(|h| h.oid)
+            .collect();
+        let fused = rsd_vector::rrf(&lexical, &semantic, k);
+        let mut out = Vec::with_capacity(fused.len());
+        for oid in fused {
+            if let Some(rec) = self.catalog.get_object(oid)? {
+                if let Some(p) = rec.entry_paths.first() {
+                    out.push(Hit {
+                        oid,
+                        path: p.clone(),
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
