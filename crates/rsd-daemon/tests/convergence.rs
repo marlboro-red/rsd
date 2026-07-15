@@ -73,7 +73,14 @@ fn wait_converged(cat: &Catalog, root: &Path, deadline: Duration) {
 #[test]
 fn live_storm_converges_with_zero_full_rescans() {
     let env = setup(800, 21);
-    let (pipeline, _) = bring_up(env.cat.clone(), &env.journal_dir, &env.root, fast_cfg()).unwrap();
+    let (pipeline, _) = bring_up(
+        env.cat.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        fast_cfg(),
+    )
+    .unwrap();
     assert_converged(&env.cat, &env.root);
 
     let mut m = Mutator::new(&env.root, 22).unwrap();
@@ -99,7 +106,7 @@ fn overflow_self_heals_with_counted_root_rescan() {
         event_capacity: 8, // force the callback to shed events
         ..fast_cfg()
     };
-    let (pipeline, _) = bring_up(env.cat.clone(), &env.journal_dir, &env.root, cfg).unwrap();
+    let (pipeline, _) = bring_up(env.cat.clone(), &env.journal_dir, &env.root, None, cfg).unwrap();
 
     for i in 0..400 {
         std::fs::write(env.root.join(format!("flood{i}.txt")), "x").unwrap();
@@ -124,7 +131,14 @@ fn overflow_self_heals_with_counted_root_rescan() {
 #[test]
 fn rename_storm_preserves_object_identity() {
     let env = setup(50, 41);
-    let (pipeline, _) = bring_up(env.cat.clone(), &env.journal_dir, &env.root, fast_cfg()).unwrap();
+    let (pipeline, _) = bring_up(
+        env.cat.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        fast_cfg(),
+    )
+    .unwrap();
     assert_converged(&env.cat, &env.root);
 
     // Track one file through a storm of renames.
@@ -170,7 +184,14 @@ fn dir_move_in_and_out_converges() {
     std::fs::create_dir(&outside).unwrap();
     gen_tree(&outside, 120, 51).unwrap();
 
-    let (pipeline, _) = bring_up(env.cat.clone(), &env.journal_dir, &env.root, fast_cfg()).unwrap();
+    let (pipeline, _) = bring_up(
+        env.cat.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        fast_cfg(),
+    )
+    .unwrap();
 
     // Move in.
     let moved_in = env.root.join("imported");

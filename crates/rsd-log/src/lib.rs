@@ -52,6 +52,8 @@ pub enum Source {
     AntiEntropy,
     Repair,
     Synthetic,
+    /// Content-indexing outcomes (SetContent records).
+    Content,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

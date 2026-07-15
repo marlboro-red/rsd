@@ -85,15 +85,43 @@ pub enum ExtractStatus {
     ResourceBudgetExceeded,
     Unsupported,
     Corrupt,
+    /// Extraction repeatedly crashed/hung on this content; recorded so the
+    /// content is never retried blindly and the reason is queryable.
+    Quarantined,
 }
 
-/// A content-derived extraction record. Phase-2 shape; chunk boundaries,
-/// references, and embeddings attach in later phases.
+impl ExtractStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExtractStatus::Complete => "complete",
+            ExtractStatus::Partial => "partial",
+            ExtractStatus::EncryptedContent => "encrypted",
+            ExtractStatus::PasswordRequired => "password-required",
+            ExtractStatus::CloudPlaceholder => "cloud-placeholder",
+            ExtractStatus::ResourceBudgetExceeded => "budget-exceeded",
+            ExtractStatus::Unsupported => "unsupported",
+            ExtractStatus::Corrupt => "corrupt",
+            ExtractStatus::Quarantined => "quarantined",
+        }
+    }
+}
+
+/// A code symbol (function/type definition) with its 1-based line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolRec {
+    pub name: String,
+    pub kind: String,
+    pub line: u32,
+}
+
+/// A content-derived extraction record. Chunk boundaries, references, and
+/// embeddings attach in later phases.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtractionRecord {
     pub status: ExtractStatus,
     pub text: String,
     pub attrs: Vec<(String, String)>,
+    pub symbols: Vec<SymbolRec>,
 }
 
 pub struct Store {
@@ -280,6 +308,7 @@ mod tests {
                 status: ExtractStatus::Complete,
                 text: String::from_utf8_lossy(bytes).into_owned(),
                 attrs: vec![("test.len".into(), bytes.len().to_string())],
+                symbols: vec![],
             }
         }
     }
@@ -305,6 +334,7 @@ mod tests {
             status: ExtractStatus::Complete,
             text: "hello".into(),
             attrs: vec![("a".into(), "b".into())],
+            symbols: vec![],
         };
         {
             let store = Store::open(&db).unwrap();

@@ -135,6 +135,12 @@ pub struct ObjectRecord {
     /// Set when the last entry was removed; the object lingers for a grace
     /// period so a rename (remove-then-probe ordering) keeps its identity.
     pub orphaned_at_ns: Option<u64>,
+    /// Content identity, set by the content indexer (None => not yet hashed
+    /// or stats changed since).
+    pub content_hash: Option<[u8; 32]>,
+    /// Extraction status string (queryable "kRSDIndexState"); None => content
+    /// not yet indexed at the current stats.
+    pub index_state: Option<String>,
 }
 
 /// What `apply_stat` did — used by scanners/tests for op accounting.
@@ -161,14 +167,29 @@ impl Applied {
 /// time, so subtree removals are expanded to per-path records at resolve time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Change {
-    Upsert { path: String, stat: StatInfo },
-    RemovePath { path: String },
+    Upsert {
+        path: String,
+        stat: StatInfo,
+    },
+    RemovePath {
+        path: String,
+    },
+    /// Journaled content-indexing outcome: sets the object's content identity
+    /// and queryable index state. Applies by path; no-op if the path is gone
+    /// (a later record will re-index whatever replaced it).
+    SetContent {
+        path: String,
+        content_hash: [u8; 32],
+        state: String,
+    },
 }
 
 impl Change {
     pub fn path(&self) -> &str {
         match self {
-            Change::Upsert { path, .. } | Change::RemovePath { path } => path,
+            Change::Upsert { path, .. }
+            | Change::RemovePath { path }
+            | Change::SetContent { path, .. } => path,
         }
     }
 }
@@ -187,6 +208,20 @@ fn apply_change_in(t: &mut Tables<'_>, ch: &Change, now_ns: u64) -> Result<()> {
         }
         Change::RemovePath { path } => {
             remove_path_in(t, path, now_ns)?;
+        }
+        Change::SetContent {
+            path,
+            content_hash,
+            state,
+        } => {
+            let oid = t.by_path.get(path.as_str())?.map(|g| g.value());
+            if let Some(oid) = oid {
+                if let Some(mut rec) = get_object(t, oid)? {
+                    rec.content_hash = Some(*content_hash);
+                    rec.index_state = Some(state.clone());
+                    put_object(t, oid, &rec)?;
+                }
+            }
         }
     }
     Ok(())
@@ -264,6 +299,11 @@ fn apply_stat_in(t: &mut Tables<'_>, path: &str, st: &StatInfo, now_ns: u64) -> 
         Some(oid) => {
             let mut rec = get_object(t, oid)?.expect("checked above");
             let was_orphan = rec.orphaned_at_ns.is_some();
+            if rec.size != st.size || rec.mtime_ns != st.mtime_ns {
+                // Content may have changed: the indexed state is stale.
+                rec.content_hash = None;
+                rec.index_state = None;
+            }
             rec.size = st.size;
             rec.mtime_ns = st.mtime_ns;
             rec.nlink = st.nlink;
@@ -302,6 +342,8 @@ fn apply_stat_in(t: &mut Tables<'_>, path: &str, st: &StatInfo, now_ns: u64) -> 
                 nlink: st.nlink,
                 entry_paths: vec![path.to_string()],
                 orphaned_at_ns: None,
+                content_hash: None,
+                index_state: None,
             };
             put_object(t, oid, &rec)?;
             t.by_fileid.insert(key.as_slice(), oid)?;
@@ -497,6 +539,19 @@ impl Catalog {
             }
         }
         Ok(out)
+    }
+
+    pub fn get_by_fileid(&self, file_id: FileId) -> Result<Option<(u64, ObjectRecord)>> {
+        let txn = self.db.begin_read()?;
+        let by_fileid = txn.open_table(BY_FILEID)?;
+        let objects = txn.open_table(OBJECTS)?;
+        let Some(oid) = by_fileid.get(file_id.key().as_slice())?.map(|g| g.value()) else {
+            return Ok(None);
+        };
+        let Some(g) = objects.get(oid)? else {
+            return Ok(None);
+        };
+        Ok(Some((oid, postcard::from_bytes(g.value())?)))
     }
 
     pub fn get_by_path(&self, path: &str) -> Result<Option<(u64, ObjectRecord)>> {

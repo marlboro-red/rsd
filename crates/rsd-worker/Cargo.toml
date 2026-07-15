@@ -1,0 +1,21 @@
+[package]
+name = "rsd-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rsd-caes = { workspace = true }
+rsd-extract = { workspace = true }
+rsd-sandbox = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+thiserror = { workspace = true }
+nix = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

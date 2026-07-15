@@ -1,0 +1,10 @@
+[package]
+name = "rsd-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No workspace lints: FFI crate (sandbox_init) — the second of exactly two
+# crates permitted to contain unsafe (the other is rsd-fsevents).
+
+[dependencies]

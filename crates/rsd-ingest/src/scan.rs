@@ -38,6 +38,7 @@ impl ScanStats {
             match ch {
                 Change::Upsert { .. } => self.upserts += 1,
                 Change::RemovePath { .. } => self.removals += 1,
+                Change::SetContent { .. } => {}
             }
         }
     }

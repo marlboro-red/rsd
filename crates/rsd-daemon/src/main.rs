@@ -63,12 +63,29 @@ fn main() -> std::io::Result<()> {
             .map_err(|e| std::io::Error::other(e.to_string()))?,
     );
 
+    // Content indexing: sealed worker pool, if the worker binary is present.
+    let content = match rsd_worker::WorkerPool::new(rsd_worker::PoolConfig::default()) {
+        Ok(pool) => {
+            let caes = rsd_caes::Store::open(&state.join("caes.redb"))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Some(rsd_daemon::ContentIndexer::new(
+                Box::new(rsd_daemon::PooledExtractor(pool)),
+                Arc::new(caes),
+            ))
+        }
+        Err(e) => {
+            eprintln!("content indexing disabled (worker pool unavailable: {e})");
+            None
+        }
+    };
+
     eprintln!("bootstrapping {}...", root.display());
     let t0 = std::time::Instant::now();
     let (pipeline, boot) = bring_up(
         catalog.clone(),
         &state.join("journal"),
         &root,
+        content,
         PipelineConfig::default(),
     )?;
     eprintln!(

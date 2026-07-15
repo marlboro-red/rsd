@@ -118,23 +118,28 @@ extraction, no query engine yet — correctness of observation only.
 
 ## Phase 3 — Extraction fabric v1 (design §10, P3 pillar)
 
-**P3.1 — Worker protocol + sandboxed pool [ ]**
+**P3.1 — Worker protocol + sandboxed pool [x]**
 - `rsd-worker` binary: fd-passing over UDS (`SCM_RIGHTS`), postcard framing,
   Seatbelt profile (no fs, no net, no exec), timeout/kill/respawn, crash quarantine
   with queryable reason.
 - Success: hostile-input test (worker that segfaults/hangs on cue) → daemon
   unaffected, file quarantined after N retries, pool self-heals; sandbox denies
   demonstrated by a probe worker (open("/etc/passwd") fails).
+- Shipped variation: instead of a host-side Seatbelt profile, the worker
+  self-seals with `sandbox_init("(deny default)")` after startup — tighter than
+  any external profile (no dyld carve-outs needed), verified by probe + control
+  group.
 
-**P3.2 — Native extractors: text + source [ ]**
+**P3.2 — Native extractors: text + source [x]**
 - Encoding detection, plain text, tree-sitter symbols for an initial language set
-  (Rust, Python, TS/JS, Go, C/C++); extraction limit contract enforced (input/
-  output/time budgets, partial results, typed status codes).
+  (shipped: Rust, Python, JavaScript, Go, C; TypeScript/C++ grammars are
+  mechanical follow-ups); extraction limit contract enforced (input/output/time
+  budgets, partial results, typed status codes).
 - Success: golden-file tests per format; limit tests (oversize input → clean
   `ResourceBudgetExceeded` partial, not OOM); status codes land as queryable
   catalog attributes.
 
-**P3.3 — Ingest integration [ ]**
+**P3.3 — Ingest integration [x]**
 - Dispatcher routes Extract items through CAES-check → worker → committer;
   `AttrsOnly` path (rename/chmod) provably skips extraction.
 - Success: end-to-end counter tests — rename storm on 1k indexed files causes 0

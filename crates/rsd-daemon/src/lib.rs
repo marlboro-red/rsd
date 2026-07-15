@@ -7,8 +7,10 @@
 //! to a *counted* scoped rescan and self-heals on the applier thread.
 
 pub mod commit;
+pub mod dispatch;
 
 pub use commit::{CommitError, Committer};
+pub use dispatch::{ContentCounters, ContentIndexer, ContentSource, PooledExtractor};
 
 use rsd_catalog::Catalog;
 use rsd_fsevents::{WatchConfig, Watcher};
@@ -73,6 +75,7 @@ impl Pipeline {
     /// bootstrapped committer. Use `bring_up` for the standard sequence.
     pub fn start(
         committer: Committer,
+        content: Option<ContentIndexer>,
         root: &Path,
         cfg: PipelineConfig,
     ) -> std::io::Result<Pipeline> {
@@ -130,7 +133,7 @@ impl Pipeline {
                 .name("rsd-applier".into())
                 .spawn(move || {
                     run_applier(
-                        committer, work_rx, &counters, &stats, grace, overflow, &root,
+                        committer, content, work_rx, &counters, &stats, grace, overflow, &root,
                     )
                 })?
         };
@@ -163,6 +166,7 @@ impl Pipeline {
 #[allow(clippy::too_many_arguments)]
 fn run_applier(
     mut committer: Committer,
+    mut content: Option<ContentIndexer>,
     work_rx: mpsc::Receiver<WorkItem>,
     counters: &PipelineCounters,
     stats: &Mutex<ScanStats>,
@@ -170,23 +174,30 @@ fn run_applier(
     overflow: Arc<AtomicBool>,
     root: &Path,
 ) {
-    let resolve_and_commit =
-        |committer: &mut Committer, item: &WorkItem, source: Source| match resolve_work(
-            committer.catalog(),
-            item,
-        ) {
+    let resolve_and_commit = |committer: &mut Committer,
+                              content: &mut Option<ContentIndexer>,
+                              item: &WorkItem,
+                              source: Source| {
+        match resolve_work(committer.catalog(), item) {
             Ok((changes, s)) => {
                 stats.lock().unwrap().absorb(s);
                 match committer.commit(source, &changes) {
                     Ok(Some(_)) => {
                         counters.commits.fetch_add(1, Ordering::Relaxed);
+                        if let Some(indexer) = content.as_mut() {
+                            let upserts = file_upserts(&changes);
+                            if !upserts.is_empty() {
+                                indexer.process(committer, &upserts);
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => tracing::error!("commit({:?}) failed: {e}", item.path),
                 }
             }
             Err(e) => tracing::warn!("resolve({:?}) failed: {e}", item.path),
-        };
+        }
+    };
 
     loop {
         // Overflow self-heal first: the callback shed events, so nothing under
@@ -195,6 +206,7 @@ fn run_applier(
             counters.full_rescans.fetch_add(1, Ordering::Relaxed);
             resolve_and_commit(
                 &mut committer,
+                &mut content,
                 &WorkItem {
                     path: root.to_path_buf(),
                     kind: WorkKind::RescanRecursive,
@@ -205,7 +217,7 @@ fn run_applier(
         match work_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(item) => {
                 counters.work_items.fetch_add(1, Ordering::Relaxed);
-                resolve_and_commit(&mut committer, &item, Source::FsEvents);
+                resolve_and_commit(&mut committer, &mut content, &item, Source::FsEvents);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Idle: reclaim orphaned identities past their grace window.
@@ -248,12 +260,28 @@ pub fn open_catalog_resilient(
     }
 }
 
+/// File upserts from a committed batch — the content indexer's input.
+fn file_upserts(changes: &[rsd_catalog::Change]) -> Vec<(String, rsd_catalog::StatInfo)> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            rsd_catalog::Change::Upsert { path, stat }
+                if stat.kind == rsd_catalog::ObjectKind::File =>
+            {
+                Some((path.clone(), *stat))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The standard bring-up sequence: open journal → recover projection →
-/// journaled bootstrap reconciliation → live pipeline.
+/// journaled bootstrap reconciliation (content-indexed) → live pipeline.
 pub fn bring_up(
     catalog: Arc<Catalog>,
     journal_dir: &Path,
     root: &Path,
+    mut content: Option<ContentIndexer>,
     cfg: PipelineConfig,
 ) -> std::io::Result<(Pipeline, ScanStats)> {
     let journal = Journal::open(
@@ -285,8 +313,14 @@ pub fn bring_up(
         committer
             .commit(Source::Scan, chunk)
             .map_err(|e| std::io::Error::other(format!("bootstrap commit: {e}")))?;
+        if let Some(indexer) = content.as_mut() {
+            let upserts = file_upserts(chunk);
+            if !upserts.is_empty() {
+                indexer.process(&mut committer, &upserts);
+            }
+        }
     }
 
-    let p = Pipeline::start(committer, root, cfg)?;
+    let p = Pipeline::start(committer, content, root, cfg)?;
     Ok((p, stats))
 }

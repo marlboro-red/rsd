@@ -13,6 +13,10 @@ rsd-catalog = { workspace = true }
 rsd-ingest = { workspace = true }
 rsd-fsevents = { workspace = true }
 rsd-log = { workspace = true }
+rsd-caes = { workspace = true }
+rsd-extract = { workspace = true }
+rsd-worker = { workspace = true }
+blake3 = { workspace = true }
 redb = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

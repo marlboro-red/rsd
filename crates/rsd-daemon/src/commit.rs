@@ -136,6 +136,7 @@ pub mod synth {
                 Change::RemovePath { path } => {
                     state.remove(&path);
                 }
+                Change::SetContent { .. } => unreachable!("synth emits no SetContent"),
             }
         }
         state
