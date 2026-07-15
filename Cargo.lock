@@ -1836,6 +1836,7 @@ dependencies = [
  "rsd-testkit",
  "rsd-vector",
  "rsd-worker",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

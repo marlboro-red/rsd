@@ -8,6 +8,7 @@
 
 pub mod commit;
 pub mod dispatch;
+pub mod http;
 pub mod ipc;
 
 pub use commit::{CommitError, Committer};

@@ -109,12 +109,15 @@ fn main() -> std::io::Result<()> {
         (Arc::new(std::sync::Mutex::new(plane)), caes.clone())
     });
     let vector_handle = vector.as_ref().map(|(p, _)| p.clone());
+    let vector_handle_http = vector_handle.clone();
+    let lexical_caes = lexical.as_ref().map(|(_, c)| c.clone());
     let caes_for_live = lexical.as_ref().map(|(_, c)| c.clone());
     let live = Arc::new(std::sync::Mutex::new({
         let mut eng = rsd_live::LiveEngine::new(caes_for_live);
         eng.set_embedder(embedder.clone());
         eng
     }));
+    let live_http = live.clone();
 
     eprintln!("bootstrapping {}...", root.display());
     let t0 = std::time::Instant::now();
@@ -139,6 +142,19 @@ fn main() -> std::io::Result<()> {
         },
     )?;
     eprintln!("ipc listening at {}", state.join("rsd.sock").display());
+    let caes_for_http = lexical_caes.clone();
+    let _http = rsd_daemon::http::start_http(
+        5871,
+        rsd_daemon::ipc::IpcCtx {
+            catalog: catalog.clone(),
+            lexical_dir: state.join("lexical"),
+            vector: vector_handle_http,
+            live: live_http,
+            authz: Arc::new(rsd_daemon::ipc::AuthzStore::default()),
+        },
+        caes_for_http,
+    )?;
+    eprintln!("http api at http://127.0.0.1:5871 (RSD.app)");
     eprintln!(
         "bootstrap done in {:?}: {} dirs, {} entries; watching (ctrl-c to exit)",
         t0.elapsed(),

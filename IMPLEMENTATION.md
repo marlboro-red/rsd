@@ -234,6 +234,12 @@ byte-range citations.
 common third-party importers run or are cleanly blacklisted; daemon uptime
 unaffected by importer crash storm.
 
+**P7.5 — RSD.app native UI [x]** (added mid-T1 by request) — SwiftUI search
+palette over a localhost JSON API (`/api/search`, `/api/status`; 127.0.0.1
+only, first-party surface): search-as-you-type across hybrid/exact/meaning
+modes, grounded snippets, file icons, ↩ open / ⌘↩ reveal, latency readout.
+`scripts/build-app.sh` → dist/RSD.app.
+
 ## Phase 8 — Time & lineage [T2]
 
 **P8.1 — Bitemporal history** — `history` table, compaction with surfaced
