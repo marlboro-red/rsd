@@ -52,8 +52,10 @@ fn main() -> std::io::Result<()> {
             name.unwrap_or_else(|| "root".into())
         ))
     });
-    if state.starts_with(&root) {
-        eprintln!("error: state dir {state:?} must live outside the watched root");
+    if state.starts_with(&root) && !rsd_ingest::excluded(&state) {
+        eprintln!(
+            "error: state dir {state:?} must live outside the watched root (or under an excluded dir like ~/Library)"
+        );
         std::process::exit(2);
     }
     std::fs::create_dir_all(&state)?;

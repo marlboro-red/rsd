@@ -61,6 +61,32 @@ pub struct WorkItem {
     pub kind: WorkKind,
 }
 
+/// Default exclusion set (DESIGN.md §14): dependency trees, VCS internals,
+/// caches, and ~/Library churn. Name-based on any path component. v1 excludes
+/// these from the catalog entirely; the catalog-but-not-content refinement
+/// comes with the attribute store expansion.
+const EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".venv",
+    ".build",
+    ".Trash",
+    ".cache",
+    "Caches",
+    "DerivedData",
+    ".npm",
+    ".cargo",
+    ".rustup",
+    "Library",
+];
+
+pub fn excluded(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(c, std::path::Component::Normal(n)
+            if EXCLUDED_DIRS.iter().any(|e| n.to_str() == Some(e)))
+    })
+}
+
 fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
@@ -116,6 +142,11 @@ fn resolve_dir(
             Err(e) if is_not_found(&e) => continue,
             Err(e) => return Err(e.into()),
         };
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if EXCLUDED_DIRS.contains(&name) {
+                continue;
+            }
+        }
         let st = StatInfo::from_metadata(&md);
         if st.kind == ObjectKind::Dir {
             child_dirs.push(path.clone());
@@ -174,6 +205,9 @@ fn resolve_rescan(
 pub fn resolve_work(cat: &Catalog, item: &WorkItem) -> Result<(Vec<Change>, ScanStats)> {
     let mut out = Vec::new();
     let mut stats = ScanStats::default();
+    if excluded(&item.path) {
+        return Ok((out, stats));
+    }
     match item.kind {
         WorkKind::RescanShallow => resolve_rescan(cat, &item.path, false, &mut out, &mut stats)?,
         WorkKind::RescanRecursive => resolve_rescan(cat, &item.path, true, &mut out, &mut stats)?,

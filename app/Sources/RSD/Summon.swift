@@ -25,6 +25,7 @@ final class Summoner: NSObject, NSApplicationDelegate {
         statusItem = item
 
         Notifier.shared.setUp()
+        DaemonManager.shared.ensureRunning()
         registerHotKey()
         showPalette()
     }
@@ -55,6 +56,10 @@ final class Summoner: NSObject, NSApplicationDelegate {
             0,
             &hotKeyRef
         )
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        DaemonManager.shared.stop()
     }
 
     @objc private func statusClicked() {

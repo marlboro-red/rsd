@@ -88,3 +88,29 @@ fn scoped_rescan_touches_only_the_requested_subtree() {
     rescan(&cat, &b, true).unwrap();
     assert_converged(&cat, &root);
 }
+
+#[test]
+fn excluded_dirs_never_enter_the_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap().join("tree");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+    std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+    std::fs::create_dir_all(root.join("Library/Caches")).unwrap();
+    std::fs::write(root.join("src/keep.rs"), "fn keep() {}").unwrap();
+    std::fs::write(root.join("node_modules/dep/skip.js"), "x").unwrap();
+    std::fs::write(root.join(".git/objects/skip"), "x").unwrap();
+    std::fs::write(root.join("Library/Caches/skip.db"), "x").unwrap();
+
+    let cat =
+        Catalog::open_with_durability(&tmp.path().join("cat.redb"), Durability::None).unwrap();
+    bootstrap(&cat, &root).unwrap();
+    let paths: Vec<String> = cat.listing().unwrap().into_keys().collect();
+    assert!(paths.iter().any(|p| p.ends_with("keep.rs")));
+    assert!(
+        !paths
+            .iter()
+            .any(|p| p.contains("node_modules") || p.contains(".git") || p.contains("Library")),
+        "{paths:?}"
+    );
+}

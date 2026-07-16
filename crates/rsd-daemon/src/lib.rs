@@ -102,6 +102,9 @@ impl Pipeline {
             .name("rsd-feeder".into())
             .spawn(move || {
                 while let Ok(ev) = event_rx.recv() {
+                    if rsd_ingest::excluded(&ev.path) {
+                        continue;
+                    }
                     let recursive = ev.flags.must_scan_subdirs() || ev.flags.dropped();
                     if ingest_tx
                         .send(IngestEvent {
