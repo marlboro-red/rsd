@@ -131,7 +131,10 @@ fn main() -> std::io::Result<()> {
         lexical,
         vector,
         Some(live.clone()),
-        PipelineConfig::default(),
+        PipelineConfig {
+            trickle_bootstrap: true,
+            ..Default::default()
+        },
     )?;
     let _ipc = rsd_daemon::ipc::start_ipc(
         &state.join("rsd.sock"),
@@ -157,18 +160,14 @@ fn main() -> std::io::Result<()> {
         caes_for_http,
     )?;
     eprintln!("http api at http://127.0.0.1:5871 (RSD.app)");
-    eprintln!(
-        "bootstrap done in {:?}: {} dirs, {} entries; watching (ctrl-c to exit)",
-        t0.elapsed(),
-        boot.dirs_read,
-        boot.upserts
-    );
+    let _ = (t0, boot);
+    eprintln!("pipeline live; trickle bootstrap running in the background (ctrl-c to exit)");
 
     loop {
         std::thread::sleep(Duration::from_secs(5));
         let s = *pipeline.stats.lock().unwrap();
         eprintln!(
-            "entries={} objects={} work_items={} commits={} full_rescans={} lstats={} removals={}",
+            "entries={} objects={} work_items={} commits={} full_rescans={} lstats={} removals={} bootstrap_dirs={}{}",
             catalog.entry_count().unwrap_or(0),
             catalog.object_count().unwrap_or(0),
             pipeline.counters.work_items.load(Ordering::Relaxed),
@@ -176,6 +175,12 @@ fn main() -> std::io::Result<()> {
             pipeline.counters.full_rescans.load(Ordering::Relaxed),
             s.lstats,
             s.removals,
+            pipeline.counters.bootstrap_dirs.load(Ordering::Relaxed),
+            if pipeline.counters.bootstrap_done.load(Ordering::Relaxed) == 1 {
+                " (done)"
+            } else {
+                ""
+            },
         );
     }
 }

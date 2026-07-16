@@ -39,6 +39,13 @@ pub struct PipelineConfig {
     /// fsync journal appends (the durability point). Tests disable for speed;
     /// kill-9 safety does not depend on it (page cache survives SIGKILL).
     pub journal_sync: bool,
+    /// Bootstrap mode: `false` = blocking full reconciliation before the
+    /// pipeline starts (tests, small scopes); `true` = the budgeted trickle
+    /// (DESIGN.md §7.2): a paced background walker feeds per-directory scans
+    /// through the same work queue as live events — the daemon answers
+    /// queries from second one, live changes preempt bulk, and the pace
+    /// drops on battery power.
+    pub trickle_bootstrap: bool,
 }
 
 impl Default for PipelineConfig {
@@ -50,6 +57,7 @@ impl Default for PipelineConfig {
             fsevents_latency: Duration::from_millis(100),
             orphan_grace: Duration::from_secs(10),
             journal_sync: true,
+            trickle_bootstrap: false,
         }
     }
 }
@@ -57,6 +65,8 @@ impl Default for PipelineConfig {
 #[derive(Debug, Default)]
 pub struct PipelineCounters {
     pub work_items: AtomicU64,
+    pub bootstrap_dirs: AtomicU64,
+    pub bootstrap_done: AtomicU64,
     pub full_rescans: AtomicU64,
     pub orphans_swept: AtomicU64,
     pub commits: AtomicU64,
@@ -70,6 +80,7 @@ pub struct Pipeline {
     applier: Option<JoinHandle<()>>,
     pub counters: Arc<PipelineCounters>,
     pub stats: Arc<Mutex<ScanStats>>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl Pipeline {
@@ -93,6 +104,7 @@ impl Pipeline {
 
         let counters = Arc::new(PipelineCounters::default());
         let stats = Arc::new(Mutex::new(ScanStats::default()));
+        let stopping = Arc::new(AtomicBool::new(false));
 
         let (ingest_tx, ingest_rx) = mpsc::channel::<IngestEvent>();
         let (work_tx, work_rx) = mpsc::sync_channel::<WorkItem>(cfg.work_capacity);
@@ -117,6 +129,19 @@ impl Pipeline {
                     }
                 }
             })?;
+
+        // Trickle bootstrap (when configured): a paced walker enqueues one
+        // shallow scan per directory through the same bounded work channel as
+        // live events — backpressure and interleaving come for free.
+        if cfg.trickle_bootstrap {
+            let tx = work_tx.clone();
+            let root = root.to_path_buf();
+            let counters_w = counters.clone();
+            let stopping_w = stopping.clone();
+            std::thread::Builder::new()
+                .name("rsd-bootstrap".into())
+                .spawn(move || trickle_walk(&root, tx, &counters_w, &stopping_w))?;
+        }
 
         // Coalescer pump. Ends when the feeder drops its sender.
         let pump = {
@@ -150,12 +175,14 @@ impl Pipeline {
             applier: Some(applier),
             counters,
             stats,
+            stopping,
         })
     }
 
     /// Stop the watcher and drain the pipeline to completion: each stage's
     /// channel disconnect cascades shutdown to the next.
     pub fn stop(mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
         if let Some(w) = self.watcher.take() {
             let _ = w.stop();
         }
@@ -275,6 +302,74 @@ pub fn open_catalog_resilient(
     }
 }
 
+/// Power-aware pacing for bulk work: the walker sleeps between directories,
+/// longer on battery. Interactive work never waits — it rides the coalescer
+/// path and interleaves whenever the applier is between bulk items.
+fn bulk_pause_ms() -> u64 {
+    // `pmset -g batt` is cheap and needs no entitlements; checked by the
+    // caller only every N directories.
+    let on_battery = std::process::Command::new("/usr/bin/pmset")
+        .args(["-g", "batt"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("Battery Power"))
+        .unwrap_or(false);
+    if on_battery {
+        60
+    } else {
+        8
+    }
+}
+
+fn trickle_walk(
+    root: &Path,
+    tx: mpsc::SyncSender<WorkItem>,
+    counters: &PipelineCounters,
+    stopping: &AtomicBool,
+) {
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    let mut pause = bulk_pause_ms();
+    let mut since_check = 0u32;
+    while let Some(dir) = queue.pop_front() {
+        if stopping.load(Ordering::Relaxed) {
+            return;
+        }
+        if rsd_ingest::excluded(&dir) {
+            continue;
+        }
+        // Discover children first (cheap readdir, no stats), then hand the
+        // heavy per-file work to the applier as one shallow scan.
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    queue.push_back(e.path());
+                }
+            }
+        }
+        counters.bootstrap_dirs.fetch_add(1, Ordering::Relaxed);
+        if tx
+            .send(WorkItem {
+                path: dir,
+                kind: WorkKind::RescanShallow,
+            })
+            .is_err()
+        {
+            return; // pipeline shut down
+        }
+        since_check += 1;
+        if since_check >= 64 {
+            since_check = 0;
+            pause = bulk_pause_ms();
+        }
+        std::thread::sleep(Duration::from_millis(pause));
+    }
+    counters.bootstrap_done.store(1, Ordering::Relaxed);
+    tracing::info!(
+        "trickle bootstrap complete: {} directories",
+        counters.bootstrap_dirs.load(Ordering::Relaxed)
+    );
+}
+
 /// File upserts from a committed batch — the content indexer's input.
 fn file_upserts(changes: &[rsd_catalog::Change]) -> Vec<(String, rsd_catalog::StatInfo)> {
     changes
@@ -331,6 +426,13 @@ pub fn bring_up(
         .map_err(|e| std::io::Error::other(format!("recovery: {e}")))?;
     if replayed > 0 {
         tracing::info!("recovered {replayed} journal records into the catalog");
+    }
+
+    if cfg.trickle_bootstrap {
+        // The walker inside Pipeline::start owns bootstrap; queries answer
+        // immediately against whatever is already indexed.
+        let p = Pipeline::start(committer, content, root, cfg)?;
+        return Ok((p, ScanStats::default()));
     }
 
     // Journaled bootstrap: resolve the whole root, commit in group batches.
