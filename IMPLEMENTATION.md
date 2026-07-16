@@ -201,12 +201,12 @@ extraction, no query engine yet — correctness of observation only.
 
 ## Phase 6 — Semantic plane (design §6.5, §8.2, spike 5) [T1]
 
-**P6.1 — `rsd-ml` learned embedder [x]** — all-MiniLM-L6-v2 via candle behind
-the Embedder trait, mean-pooled + normalized, 6.9ms/chunk CPU; hash-projection
-fallback when the model is absent (scripts/fetch-model.sh). Paraphrase proof:
-zero-shared-vocabulary queries rank correctly. Deferred within P6.1: the
-evictable sidecar *process* (transport change behind the same trait) and the
-ANE/Metal device path (throughput, not capability). — batched embedding protocol, CoreML/ANE path, candle
+**P6.1 — learned embedder + ANE sidecar [x]** — MiniLM via candle (CPU,
+6.9ms/chunk) AND the ANE sidecar: rsd-embed runs Apple's NLContextualEmbedding
+(512-dim, Neural-Engine transformer, no model files shipped) as a separate
+evictable process behind the Embedder trait; the daemon respawns it
+transparently if it dies (resilience-tested: sidecar killed mid-run, daemon
+survives + keeps indexing). Chain: ANE sidecar > in-process MiniLM > hash. — batched embedding protocol, CoreML/ANE path, candle
 fallback, full idle eviction. Success: ≥ 2k chunks/sec (adopt) or documented
 fallback throughput; RSS returns to baseline after idle timeout.
 **P6.2 [x]** — structure-aware chunks, HNSW segments with

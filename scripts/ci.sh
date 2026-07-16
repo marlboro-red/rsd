@@ -21,6 +21,11 @@ if swift build --package-path ocr -c release >/dev/null 2>&1; then
   export RSD_OCR_BIN="$(cd ocr && swift build -c release --show-bin-path)/rsd-ocr"
 fi
 
+echo "==> build rsd-embed sidecar (for the ANE gate test)"
+if swift build --package-path embed -c release >/dev/null 2>&1; then
+  export RSD_EMBED_BIN="$(cd embed && swift build -c release --show-bin-path)/rsd-embed"
+fi
+
 echo "==> cargo test"
 cargo test --workspace
 

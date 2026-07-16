@@ -8,3 +8,4 @@ ocr/.build/
 app/.build
 ocr/.build
 plugins/subtitles/target
+embed/.build

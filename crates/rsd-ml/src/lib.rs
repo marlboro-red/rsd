@@ -8,6 +8,9 @@
 //! Model files (config.json, tokenizer.json, model.safetensors) load from a
 //! directory — `scripts/fetch-model.sh` populates ~/.cache/rsd/models/minilm.
 
+mod sidecar;
+pub use sidecar::{SidecarEmbedder, SIDECAR_ID};
+
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};

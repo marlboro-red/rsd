@@ -41,6 +41,8 @@ jobs:
         run: ./scripts/build-app.sh
       - name: Build OCR helper
         run: swift build --package-path ocr -c release
+      - name: Build embedding sidecar
+        run: swift build --package-path embed -c release
       - name: Build wasm plugin
         run: |
           rustup target add wasm32-unknown-unknown
@@ -51,6 +53,7 @@ jobs:
           cp target/release/rsd-daemon target/release/rsdfind \
              target/release/rsd-mcp target/release/rsd-worker dist/bin/
           cp "$(cd ocr && swift build -c release --show-bin-path)/rsd-ocr" dist/bin/
+          cp "$(cd embed && swift build -c release --show-bin-path)/rsd-embed" dist/bin/
           mkdir -p dist/plugins
           cp plugins/subtitles/target/wasm32-unknown-unknown/release/rsd_plugin_subtitles.wasm dist/plugins/
           cp scripts/fetch-model.sh dist/bin/
