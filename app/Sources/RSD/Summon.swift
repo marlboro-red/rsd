@@ -7,7 +7,7 @@ import Carbon
 import SwiftUI
 
 @MainActor
-final class Summoner: NSObject, NSApplicationDelegate {
+final class Summoner: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
 
@@ -27,6 +27,22 @@ final class Summoner: NSObject, NSApplicationDelegate {
         Notifier.shared.setUp()
         DaemonManager.shared.ensureRunning()
         registerHotKey()
+
+        // The palette window must never actually close (an accessory app
+        // keeps running; a destroyed WindowGroup window can't be re-shown, so
+        // reopen and the hotkey would go dead). Adopt every key window and
+        // turn its close into hide.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { note in
+            Task { @MainActor in
+                if let window = note.object as? NSWindow, window.canBecomeKey {
+                    window.delegate = self
+                }
+            }
+        }
         showPalette()
     }
 
@@ -60,6 +76,22 @@ final class Summoner: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         DaemonManager.shared.stop()
+    }
+
+    /// Red button / ⌘W: hide, never destroy — the palette must be summonable
+    /// forever.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        NSApp.hide(nil)
+        return false
+    }
+
+    /// Finder/Dock reopen of the running instance: summon the palette.
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows: Bool
+    ) -> Bool {
+        showPalette()
+        return true
     }
 
     @objc private func statusClicked() {
