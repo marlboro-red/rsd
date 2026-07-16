@@ -60,14 +60,11 @@ final class AlertStore: ObservableObject {
     }
 
     private static func stream(_ alert: SavedAlert) async {
-        var comps = URLComponents(string: "http://127.0.0.1:5871/api/alert")!
-        comps.queryItems = [
+        let url = API.url("/api/alert", [
             .init(name: "q", value: alert.query),
             .init(name: "threshold", value: String(alert.threshold)),
-        ]
-        guard let url = comps.url,
-              let (bytes, _) = try? await URLSession.shared.bytes(from: url)
-        else { return }
+        ])
+        guard let (bytes, _) = try? await URLSession.shared.bytes(from: url) else { return }
         do {
             for try await line in bytes.lines {
                 guard line.hasPrefix("data: "),

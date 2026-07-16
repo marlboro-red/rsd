@@ -1831,6 +1831,7 @@ dependencies = [
  "rsd-lexical",
  "rsd-live",
  "rsd-log",
+ "rsd-metrics",
  "rsd-ml",
  "rsd-query",
  "rsd-testkit",
@@ -1935,6 +1936,13 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rsd-metrics"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

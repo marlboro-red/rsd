@@ -147,9 +147,18 @@ fn main() -> std::io::Result<()> {
         },
     )?;
     eprintln!("ipc listening at {}", state.join("rsd.sock").display());
+
+    // Loopback secret for the HTTP surface: a random token in a 0600 file the
+    // native app reads. Without it, any web page could read the index over
+    // 127.0.0.1. Regenerated each start.
+    let token = rsd_daemon::http::gen_token();
+    let token_path = state.join("http.token");
+    rsd_daemon::http::write_token(&token_path, &token)?;
+
     let caes_for_http = lexical_caes.clone();
     let _http = rsd_daemon::http::start_http(
         5871,
+        token,
         rsd_daemon::ipc::IpcCtx {
             catalog: catalog.clone(),
             lexical_dir: state.join("lexical"),
@@ -159,7 +168,10 @@ fn main() -> std::io::Result<()> {
         },
         caes_for_http,
     )?;
-    eprintln!("http api at http://127.0.0.1:5871 (RSD.app)");
+    eprintln!(
+        "http api at http://127.0.0.1:5871 (token at {})",
+        token_path.display()
+    );
     let _ = (t0, boot);
     eprintln!("pipeline live; trickle bootstrap running in the background (ctrl-c to exit)");
 

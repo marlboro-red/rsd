@@ -15,6 +15,7 @@ members = [
     "crates/rsd-live",
     "crates/rsd-vector",
     "crates/rsd-ml",
+    "crates/rsd-metrics",
     "crates/rsd-ipc",
     "crates/rsd-testkit",
     "crates/rsd-daemon",
@@ -41,6 +42,7 @@ rsd-query = { path = "crates/rsd-query" }
 rsd-live = { path = "crates/rsd-live" }
 rsd-vector = { path = "crates/rsd-vector" }
 rsd-ml = { path = "crates/rsd-ml" }
+rsd-metrics = { path = "crates/rsd-metrics" }
 rsd-ipc = { path = "crates/rsd-ipc" }
 
 blake3 = "1"

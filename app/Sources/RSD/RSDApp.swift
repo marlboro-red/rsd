@@ -93,8 +93,7 @@ final class SearchModel: ObservableObject {
     private func startLiveRefresh() {
         liveTask = Task {
             while !Task.isCancelled {
-                if let url = URL(string: "http://127.0.0.1:5871/api/events"),
-                   let (bytes, _) = try? await URLSession.shared.bytes(from: url) {
+                if let (bytes, _) = try? await URLSession.shared.bytes(from: API.url("/api/events")) {
                     do {
                         for try await line in bytes.lines {
                             guard line.hasPrefix("data: ") else { continue }
@@ -123,14 +122,13 @@ final class SearchModel: ObservableObject {
                 }
                 return
             }
-            var comps = URLComponents(string: "http://127.0.0.1:5871/api/search")!
-            comps.queryItems = [
+            let url = API.url("/api/search", [
                 .init(name: "q", value: q),
                 .init(name: "mode", value: mode),
                 .init(name: "limit", value: "40"),
-            ]
+            ])
             do {
-                let (data, _) = try await URLSession.shared.data(from: comps.url!)
+                let (data, _) = try await URLSession.shared.data(from: url)
                 if Task.isCancelled { return }
                 let resp = try JSONDecoder().decode(SearchResponse.self, from: data)
                 withAnimation(.spring(duration: 0.28)) {

@@ -19,6 +19,7 @@ rsd-worker = { workspace = true }
 rsd-lexical = { workspace = true }
 rsd-live = { workspace = true }
 rsd-vector = { workspace = true }
+rsd-metrics = { workspace = true }
 rsd-ml = { workspace = true }
 rsd-ipc = { workspace = true }
 rsd-query = { workspace = true }

@@ -154,14 +154,25 @@ impl ContentIndexer {
         let status = match self.caes.get(&key) {
             Ok(Some(rec)) => {
                 self.counters.caes_hits.fetch_add(1, Ordering::Relaxed);
+                rsd_metrics::metrics().caes_hits.inc();
                 rec.status
             }
             Ok(None) | Err(CaesError::Corrupt { .. }) => {
                 if matches!(self.caes.get(&key), Err(CaesError::Corrupt { .. })) {
                     let _ = self.caes.evict(&key);
                 }
-                match self.source.extract_file(p, &hints, &self.budgets) {
+                rsd_metrics::metrics().caes_misses.inc();
+                let t_ex = std::time::Instant::now();
+                let extracted = self.source.extract_file(p, &hints, &self.budgets);
+                rsd_metrics::metrics()
+                    .extract_ms
+                    .record(t_ex.elapsed().as_secs_f64() * 1000.0);
+                match extracted {
                     Ok(rec) => {
+                        rsd_metrics::metrics().files_indexed.inc();
+                        if rec.status.as_str() != "complete" && rec.status.as_str() != "partial" {
+                            rsd_metrics::metrics().record_extraction_failure(rec.status.as_str());
+                        }
                         self.caes.put(&key, &rec).map_err(|e| e.to_string())?;
                         self.counters.extractions.fetch_add(1, Ordering::Relaxed);
                         self.failures.remove(&content_hash);
@@ -186,6 +197,8 @@ impl ContentIndexer {
                         };
                         self.caes.put(&key, &qrec).map_err(|e| e.to_string())?;
                         self.counters.quarantined.fetch_add(1, Ordering::Relaxed);
+                        rsd_metrics::metrics().quarantines.inc();
+                        rsd_metrics::metrics().record_extraction_failure("quarantined");
                         self.failures.remove(&content_hash);
                         ExtractStatus::Quarantined
                     }

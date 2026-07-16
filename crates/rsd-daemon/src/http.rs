@@ -14,17 +14,45 @@ use rsd_extract::{EXTRACTOR_ID, EXTRACTOR_VERSION};
 use rsd_lexical::LexicalReader;
 use rsd_query::{parse, QueryEngine};
 use serde_json::json;
+use std::io::Read as _;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
+
+/// 32 hex chars from the OS RNG — the loopback secret.
+pub fn gen_token() -> String {
+    let mut buf = [0u8; 16];
+    // /dev/urandom needs no crate; fall back to time-mixed if it ever fails.
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Write the token 0600 (user-only), atomically.
+pub fn write_token(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("token.tmp");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(token.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
 
 pub fn start_http(
     port: u16,
+    token: String,
     ctx: IpcCtx,
     caes: Option<Arc<rsd_caes::Store>>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    let ctx = Arc::new((ctx, caes));
+    let ctx = Arc::new((ctx, caes, token));
     std::thread::Builder::new()
         .name("rsd-http".into())
         .spawn(move || {
@@ -34,7 +62,7 @@ pub fn start_http(
                 let _ = std::thread::Builder::new()
                     .name("rsd-http-conn".into())
                     .spawn(move || {
-                        let _ = serve(stream, &ctx.0, ctx.1.as_deref());
+                        let _ = serve(stream, &ctx.0, ctx.1.as_deref(), &ctx.2);
                     });
             }
         })
@@ -87,7 +115,7 @@ fn query_params(path: &str) -> (String, Vec<(String, String)>) {
 fn respond(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -96,17 +124,25 @@ fn serve(
     mut stream: TcpStream,
     ctx: &IpcCtx,
     caes: Option<&rsd_caes::Store>,
+    token: &str,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
-    // Drain headers.
+    // Drain headers, capturing the auth header.
+    let mut header_token: Option<String> = None;
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h)? == 0 || h == "\r\n" || h == "\n" {
             break;
+        }
+        if let Some(v) = h
+            .strip_prefix("X-RSD-Token:")
+            .or_else(|| h.strip_prefix("x-rsd-token:"))
+        {
+            header_token = Some(v.trim().to_string());
         }
     }
     if method != "GET" {
@@ -120,6 +156,18 @@ fn serve(
             .map(|(_, v)| v.clone())
     };
 
+    // Loopback-secret gate (closes the browser-reachable-localhost hole): the
+    // token lives in a 0600 file only the user can read; a web page can send a
+    // request but cannot read the secret, so it cannot authenticate.
+    let presented = get("token").or(header_token).unwrap_or_default();
+    if presented.as_bytes() != token.as_bytes() {
+        return respond(
+            &mut stream,
+            "403 Forbidden",
+            r#"{"error":"missing or bad token"}"#,
+        );
+    }
+
     match path.as_str() {
         "/api/status" => {
             let body = json!({
@@ -128,6 +176,18 @@ fn serve(
                 "semantic": ctx.vector.is_some(),
             });
             respond(&mut stream, "200 OK", &body.to_string())
+        }
+        "/api/metrics" => {
+            // The metric plane snapshot (§18.5.2). Cardinality-bounded by
+            // construction; behind the same loopback-token gate as everything.
+            rsd_metrics::metrics()
+                .catalog_entries
+                .set(ctx.catalog.entry_count().unwrap_or(0) as i64);
+            respond(
+                &mut stream,
+                "200 OK",
+                &rsd_metrics::snapshot_json().to_string(),
+            )
         }
         "/api/search" => {
             let q = get("q").unwrap_or_default();
@@ -221,7 +281,7 @@ fn serve(
 fn sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n"
     )
 }
 

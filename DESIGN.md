@@ -827,3 +827,57 @@ boldness never taxes correctness.
 *The one-line test for every future feature: does it make the machine's memory of
 itself more complete, more current, or more askable — with a guarantee that names its
 authority, its failure mode, and its test? If not, it doesn't belong in rsd.*
+
+---
+
+## 18. Observability — the daemon's account of itself (shipped: metric plane)
+
+Unobservable-by-neglect is a bug, the corollary of §0's unindexed-by-neglect.
+Three planes, distinct authorities (mirroring §1): **events** (the narrative —
+`tracing`), **metrics** (quantities over time — `rsd-metrics`), **spans** (one
+item's causal timeline). This is a *projection of the §7.3 commit state
+machine*, not a parallel set of print statements — it hangs off transitions
+that already exist.
+
+### 18.1 What shipped (v0.3+)
+
+- **`rsd-metrics`**: counters, gauges, fixed-bucket histograms (log-spaced
+  0.1ms→60s, constant memory, percentiles on read). **Cardinality-safe by
+  construction**: every metric is a named field or an enum-indexed array —
+  there is no dynamic `String→metric` map, so a per-path/per-query label (the
+  O(files) growth P4 forbids) *cannot be expressed*. Paths and queries live in
+  the event plane only.
+- **Inline stage timing on the applier thread.** Today a live item's whole
+  journey (resolve → commit(Upsert) → sealed-worker extract → commit(SetContent))
+  is synchronous on one thread, so timing needs no cross-thread keyed table.
+  `index_latency_ms` is recorded for **Probe (single live-edit) items only** —
+  bulk bootstrap scans are coarse-grained (§18.6), so directory-sized samples
+  never pollute the freshness histogram. This makes the §7.5 freshness target
+  *measured, not asserted*.
+- **Real-today metrics wired**: `files_indexed`, `caes_hits/misses` (dedup
+  effectiveness), `commits`, `extract_ms`, `commit_ms`, `index_latency_ms`,
+  `full_rescans` (the convergence canary), `quarantines`,
+  `extraction_failures{status}`, `journal_replays`, `catalog_entries`,
+  `bootstrap_dirs/done`.
+- **`/api/metrics`** JSON snapshot + the **RSD.app Activity HUD** (1Hz, pure
+  reader): files indexed, live latency p50/p99, commit latency, dedup rate,
+  bootstrap progress, and a green/orange convergence light off `full_rescans`.
+- **Loopback-secret gate (§18.5.2, done first as its own fix).** The HTTP
+  surface — `/api/search` included — was reachable by any web page via
+  `ACAO:*` on `127.0.0.1`. Now every request requires a token from a 0600 file
+  the native app reads and a web page cannot; `ACAO:*` removed.
+- **Flood test**: cardinality stays flat and percentiles stay finite under 1M
+  samples.
+
+### 18.2 Deferred, and honestly why
+
+Metrics that measure the *aspirational async* pipeline read trivial until it
+lands, so they are intentionally **not** shown as if meaningful yet:
+`semantic_delta` / `semantic_gen_lag` / `embed_queue_depth` (embedding is
+currently synchronous *inside* commit — which is itself why `commit_ms` p50 is
+~7ms, a cost the HUD now makes visible); per-**sidecar** `rss_bytes` (the ML
+embedder is in-process, not yet a separate process). `worker_crashes` needs
+plumbing through the `ContentSource` trait. Structured JSONL event sink with
+sampling, and `rsdctl top`/`doctor`, are the next slices. Each lights up when
+its underlying subsystem (async embedder, processization) lands — the metric
+plane is the seam, already in place.

@@ -10,6 +10,7 @@ import SwiftUI
 final class Summoner: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
+    private var activityWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory) // menu bar app: no Dock icon
@@ -119,10 +120,32 @@ final class Summoner: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         menu.addItem(.separator())
+        let activity = NSMenuItem(title: "Index Activity…", action: #selector(showActivity), keyEquivalent: "")
+        activity.target = self
+        menu.addItem(activity)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit RSD", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
         statusItem?.button?.performClick(nil)
         statusItem?.menu = nil
+    }
+
+    @objc private func showActivity() {
+        if let w = activityWindow {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let hosting = NSHostingController(rootView: ActivityView())
+        let w = NSWindow(contentViewController: hosting)
+        w.title = "Index Activity"
+        w.styleMask = [.titled, .closable, .fullSizeContentView]
+        w.titlebarAppearsTransparent = true
+        w.isReleasedWhenClosed = false
+        w.center()
+        activityWindow = w
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc private func removeAlert(_ sender: NSMenuItem) {

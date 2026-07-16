@@ -25,10 +25,13 @@ final class DaemonManager {
     }
 
     private func responds() async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:5871/api/status") else { return false }
-        var req = URLRequest(url: url)
+        var req = URLRequest(url: API.url("/api/status"))
         req.timeoutInterval = 1.5
-        return (try? await URLSession.shared.data(for: req)) != nil
+        if let (_, resp) = try? await URLSession.shared.data(for: req),
+           let http = resp as? HTTPURLResponse {
+            return http.statusCode == 200
+        }
+        return false
     }
 
     private func launch() {

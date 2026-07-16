@@ -216,6 +216,7 @@ fn run_applier(
                 match committer.commit(source, &changes) {
                     Ok(Some(_)) => {
                         counters.commits.fetch_add(1, Ordering::Relaxed);
+                        rsd_metrics::metrics().commits.inc();
                         if let Some(indexer) = content.as_mut() {
                             let upserts = file_upserts(&changes);
                             if !upserts.is_empty() {
@@ -236,6 +237,7 @@ fn run_applier(
         // the root can be trusted as observed — reconcile it (counted).
         if overflow.swap(false, Ordering::Relaxed) {
             counters.full_rescans.fetch_add(1, Ordering::Relaxed);
+            rsd_metrics::metrics().full_rescans.inc();
             resolve_and_commit(
                 &mut committer,
                 &mut content,
@@ -249,7 +251,22 @@ fn run_applier(
         match work_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(item) => {
                 counters.work_items.fetch_add(1, Ordering::Relaxed);
+                // The whole item journey is synchronous on this thread: resolve
+                // (readdir/lstat) + commit(Upsert) + extract (worker round-trip)
+                // + commit(SetContent). Time inline — no cross-thread keyed
+                // table needed until the async embedder lands. Only PROBE items
+                // are single live-edited files; RescanShallow/Recursive are
+                // bulk (bootstrap/overflow) and would pollute the freshness
+                // histogram with directory-sized samples (§18.6: bulk coarse,
+                // interactive fine).
+                let fine = item.kind == WorkKind::Probe;
+                let t0 = std::time::Instant::now();
                 resolve_and_commit(&mut committer, &mut content, &item, Source::FsEvents);
+                if fine {
+                    rsd_metrics::metrics()
+                        .index_latency_ms
+                        .record(t0.elapsed().as_secs_f64() * 1000.0);
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Idle: reclaim orphaned identities past their grace window.
@@ -347,6 +364,9 @@ fn trickle_walk(
             }
         }
         counters.bootstrap_dirs.fetch_add(1, Ordering::Relaxed);
+        rsd_metrics::metrics()
+            .bootstrap_dirs
+            .set(counters.bootstrap_dirs.load(Ordering::Relaxed) as i64);
         if tx
             .send(WorkItem {
                 path: dir,
@@ -364,6 +384,7 @@ fn trickle_walk(
         std::thread::sleep(Duration::from_millis(pause));
     }
     counters.bootstrap_done.store(1, Ordering::Relaxed);
+    rsd_metrics::metrics().bootstrap_done.set(1);
     tracing::info!(
         "trickle bootstrap complete: {} directories",
         counters.bootstrap_dirs.load(Ordering::Relaxed)

@@ -88,6 +88,7 @@ impl Committer {
         if changes.is_empty() {
             return Ok(None);
         }
+        let t_commit = std::time::Instant::now();
         let (first, last) = self.journal.append(source, changes)?;
         let deltas = self.catalog.apply_changes(first, changes)?;
         if let Some((plane, caes)) = self.lexical.as_mut() {
@@ -107,6 +108,9 @@ impl Committer {
         if let Some(hook) = self.on_commit.as_mut() {
             hook(&deltas);
         }
+        rsd_metrics::metrics()
+            .commit_ms
+            .record(t_commit.elapsed().as_secs_f64() * 1000.0);
         Ok(Some((first, last)))
     }
 
@@ -128,6 +132,9 @@ impl Committer {
         let mut pending: Vec<LogRecord> = Vec::new();
         self.journal.replay(applied + 1, |rec| pending.push(rec))?;
         let replayed = pending.len() as u64;
+        if replayed > 0 {
+            rsd_metrics::metrics().journal_replays.add(replayed);
+        }
         for chunk in pending.chunks(1024) {
             let first = chunk[0].lsn;
             let changes: Vec<Change> = chunk.iter().map(|r| r.change.clone()).collect();
