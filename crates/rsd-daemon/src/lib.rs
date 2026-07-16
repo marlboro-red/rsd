@@ -10,6 +10,7 @@ pub mod commit;
 pub mod dispatch;
 pub mod http;
 pub mod ipc;
+pub mod ocr;
 
 pub use commit::{CommitError, Committer};
 pub use dispatch::{ContentCounters, ContentIndexer, ContentSource, PooledExtractor};

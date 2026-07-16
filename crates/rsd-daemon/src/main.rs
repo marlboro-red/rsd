@@ -74,13 +74,18 @@ fn main() -> std::io::Result<()> {
             );
             let plane = rsd_lexical::LexicalPlane::open(&state.join("lexical"))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
-            (
-                Some(rsd_daemon::ContentIndexer::new(
-                    Box::new(rsd_daemon::PooledExtractor(pool)),
-                    caes.clone(),
-                )),
-                Some((plane, caes)),
-            )
+            let mut indexer = rsd_daemon::ContentIndexer::new(
+                Box::new(rsd_daemon::PooledExtractor(pool)),
+                caes.clone(),
+            );
+            match rsd_daemon::ocr::OcrExtractor::discover() {
+                Some(ocr) => {
+                    eprintln!("ocr: Vision text recognition enabled");
+                    indexer = indexer.with_ocr(Box::new(ocr));
+                }
+                None => eprintln!("ocr: disabled (rsd-ocr helper not found)"),
+            }
+            (Some(indexer), Some((plane, caes)))
         }
         Err(e) => {
             eprintln!("content indexing disabled (worker pool unavailable: {e})");

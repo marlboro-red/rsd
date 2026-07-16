@@ -36,11 +36,14 @@ jobs:
         run: cargo build --release -p rsd-daemon -p rsd-cli -p rsd-worker
       - name: Build RSD.app
         run: ./scripts/build-app.sh
+      - name: Build OCR helper
+        run: swift build --package-path ocr -c release
       - name: Assemble bundle
         run: |
           mkdir -p dist/bin
           cp target/release/rsd-daemon target/release/rsdfind \
              target/release/rsd-mcp target/release/rsd-worker dist/bin/
+          cp "$(cd ocr && swift build -c release --show-bin-path)/rsd-ocr" dist/bin/
           cp scripts/fetch-model.sh dist/bin/
           tar -C dist -czf rsd-macos-arm64.tar.gz bin RSD.app
       - uses: actions/upload-artifact@v4

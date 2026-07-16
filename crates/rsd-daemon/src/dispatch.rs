@@ -60,6 +60,7 @@ pub struct ContentCounters {
 
 pub struct ContentIndexer {
     source: Box<dyn ContentSource>,
+    ocr: Option<Box<dyn ContentSource>>,
     caes: Arc<Store>,
     budgets: Budgets,
     failures: HashMap<[u8; 32], u32>,
@@ -87,11 +88,19 @@ impl ContentIndexer {
     pub fn new(source: Box<dyn ContentSource>, caes: Arc<Store>) -> ContentIndexer {
         ContentIndexer {
             source,
+            ocr: None,
             caes,
             budgets: Budgets::default(),
             failures: HashMap::new(),
             counters: Arc::new(ContentCounters::default()),
         }
+    }
+
+    /// Attach the OCR source; image files route to it instead of the text
+    /// worker.
+    pub fn with_ocr(mut self, ocr: Box<dyn ContentSource>) -> ContentIndexer {
+        self.ocr = Some(ocr);
+        self
     }
 
     /// Content-index the file upserts of a just-committed batch, journaling
@@ -163,7 +172,17 @@ impl ContentIndexer {
                 }
                 rsd_metrics::metrics().caes_misses.inc();
                 let t_ex = std::time::Instant::now();
-                let extracted = self.source.extract_file(p, &hints, &self.budgets);
+                // Route images to OCR (Vision helper), everything else to the
+                // sealed text/PDF worker.
+                let use_ocr = rsd_extract::is_image(&hints.name) && self.ocr.is_some();
+                let extracted = if use_ocr {
+                    self.ocr
+                        .as_mut()
+                        .unwrap()
+                        .extract_file(p, &hints, &self.budgets)
+                } else {
+                    self.source.extract_file(p, &hints, &self.budgets)
+                };
                 rsd_metrics::metrics()
                     .extract_ms
                     .record(t_ex.elapsed().as_secs_f64() * 1000.0);

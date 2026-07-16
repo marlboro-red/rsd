@@ -78,6 +78,19 @@ pub enum Format {
     Binary,
 }
 
+/// Image formats OCR can read. The extension already varies the CAES
+/// hints_hash, so an image's OCR record never collides with a text record.
+pub fn is_image(name: &str) -> bool {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tiff" | "tif" | "heic" | "webp"
+    )
+}
+
 /// Sniff by extension first, then content shape.
 pub fn sniff(hints: &ExtractHints, bytes: &[u8]) -> Format {
     if bytes.starts_with(b"%PDF-") || hints.extension() == "pdf" {

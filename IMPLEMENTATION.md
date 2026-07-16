@@ -221,7 +221,10 @@ watermarks.
 
 ## Phase 7 — Platform surfaces [T1]
 
-**P7.1 — PDF + OCR + media pipeline [~]** (PDF text extraction shipped: pure-Rust v1 with typed statuses, panic-contained locally AND by the sealed worker; searchable lexically + semantically e2e. pdfium quality upgrade, Vision OCR, and whisper transcription remain) (pdfium in-sandbox, Vision OCR, whisper
+**P7.1 — PDF + OCR + media pipeline [~]** (PDF text extraction shipped; **Vision
+OCR shipped**: images route to the rsd-ocr helper, screenshots searchable by
+their pixel-text lexically AND semantically e2e, test in the gate. pdfium
+quality upgrade and whisper A/V transcription remain) (pdfium in-sandbox, Vision OCR, whisper
 opt-in; power gating). Success: budget/status contract tests incl. adversarial
 archive set; battery gate verified via powermetrics protocol.
 **P7.2 — WASM extractor ABI** (WIT interface, fuel/memory/output budgets, EPUB
