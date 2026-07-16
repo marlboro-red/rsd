@@ -42,6 +42,7 @@ final class DaemonManager {
         else { return }
 
         try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        copyBundledPlugins()
         let p = Process()
         p.executableURL = bin
         p.arguments = ["watch", NSHomeDirectory(), "--state", stateDir.path]
@@ -51,6 +52,20 @@ final class DaemonManager {
         ) ?? FileHandle.nullDevice
         try? p.run()
         process = p
+    }
+
+    /// Copy bundled .wasm extractor plugins into <state>/plugins so the daemon
+    /// loads them. Overwrites (bundle is the source of truth for shipped ones).
+    private func copyBundledPlugins() {
+        guard let src = Bundle.main.resourceURL?.appendingPathComponent("plugins") else { return }
+        let dst = stateDir.appendingPathComponent("plugins")
+        try? FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
+        let items = (try? FileManager.default.contentsOfDirectory(at: src, includingPropertiesForKeys: nil)) ?? []
+        for wasm in items where wasm.pathExtension == "wasm" {
+            let target = dst.appendingPathComponent(wasm.lastPathComponent)
+            try? FileManager.default.removeItem(at: target)
+            try? FileManager.default.copyItem(at: wasm, to: target)
+        }
     }
 
     private func logFile() -> URL {

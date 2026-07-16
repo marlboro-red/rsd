@@ -31,6 +31,18 @@ pub trait ContentSource: Send {
         hints: &ExtractHints,
         budgets: &Budgets,
     ) -> Result<ExtractionRecord, String>;
+
+    /// Does this source claim `name`? Default: no (the base text/PDF source is
+    /// the fallback, tried last).
+    fn handles(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// CAES-key discriminator so this source's records don't collide with
+    /// another processor's over the same bytes.
+    fn processor_tag(&self) -> &str {
+        ""
+    }
 }
 
 /// Sealed worker pool as a content source.
@@ -61,6 +73,7 @@ pub struct ContentCounters {
 pub struct ContentIndexer {
     source: Box<dyn ContentSource>,
     ocr: Option<Box<dyn ContentSource>>,
+    wasm: Option<Box<dyn ContentSource>>,
     caes: Arc<Store>,
     budgets: Budgets,
     failures: HashMap<[u8; 32], u32>,
@@ -89,6 +102,7 @@ impl ContentIndexer {
         ContentIndexer {
             source,
             ocr: None,
+            wasm: None,
             caes,
             budgets: Budgets::default(),
             failures: HashMap::new(),
@@ -101,6 +115,28 @@ impl ContentIndexer {
     pub fn with_ocr(mut self, ocr: Box<dyn ContentSource>) -> ContentIndexer {
         self.ocr = Some(ocr);
         self
+    }
+
+    /// Attach the WASM plugin host; files whose extension a plugin declared
+    /// route to it (highest priority — an explicit plugin wins).
+    pub fn with_wasm(mut self, wasm: Box<dyn ContentSource>) -> ContentIndexer {
+        self.wasm = Some(wasm);
+        self
+    }
+
+    /// Pick the processor for a file: explicit plugin > OCR (images) > default.
+    fn route(&mut self, name: &str) -> (&mut dyn ContentSource, String) {
+        if self.wasm.as_ref().is_some_and(|w| w.handles(name)) {
+            let w = self.wasm.as_mut().unwrap();
+            let tag = w.processor_tag().to_string();
+            return (w.as_mut(), tag);
+        }
+        if self.ocr.as_ref().is_some_and(|o| o.handles(name)) {
+            let o = self.ocr.as_mut().unwrap();
+            let tag = o.processor_tag().to_string();
+            return (o.as_mut(), tag);
+        }
+        (self.source.as_mut(), String::new())
     }
 
     /// Content-index the file upserts of a just-committed batch, journaling
@@ -151,7 +187,17 @@ impl ContentIndexer {
                 .unwrap_or_default(),
             full_size,
         };
-        let hints_hash = hints.hints_hash(truncated);
+        // Route first so the CAES key is discriminated by the processor.
+        let processor = {
+            if self.wasm.as_ref().is_some_and(|w| w.handles(&hints.name)) {
+                self.wasm.as_ref().unwrap().processor_tag().to_string()
+            } else if self.ocr.as_ref().is_some_and(|o| o.handles(&hints.name)) {
+                self.ocr.as_ref().unwrap().processor_tag().to_string()
+            } else {
+                String::new()
+            }
+        };
+        let hints_hash = hints.hints_hash_with(truncated, &processor);
         let key = CaesKey {
             content_hash,
             extractor_id: EXTRACTOR_ID.into(),
@@ -172,17 +218,12 @@ impl ContentIndexer {
                 }
                 rsd_metrics::metrics().caes_misses.inc();
                 let t_ex = std::time::Instant::now();
-                // Route images to OCR (Vision helper), everything else to the
-                // sealed text/PDF worker.
-                let use_ocr = rsd_extract::is_image(&hints.name) && self.ocr.is_some();
-                let extracted = if use_ocr {
-                    self.ocr
-                        .as_mut()
-                        .unwrap()
-                        .extract_file(p, &hints, &self.budgets)
-                } else {
-                    self.source.extract_file(p, &hints, &self.budgets)
-                };
+                // Route: explicit WASM plugin > OCR (images) > sealed text/PDF
+                // worker. `processor` above is derived the same way, so the
+                // CAES key matches the source that runs.
+                let budgets = self.budgets;
+                let (src, _) = self.route(&hints.name);
+                let extracted = src.extract_file(p, &hints, &budgets);
                 rsd_metrics::metrics()
                     .extract_ms
                     .record(t_ex.elapsed().as_secs_f64() * 1000.0);

@@ -5,3 +5,6 @@ dist/
 app/.build/
 app/.build/
 ocr/.build/
+app/.build
+ocr/.build
+plugins/subtitles/target

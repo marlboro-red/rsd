@@ -85,6 +85,19 @@ fn main() -> std::io::Result<()> {
                 }
                 None => eprintln!("ocr: disabled (rsd-ocr helper not found)"),
             }
+            // WASM extractor plugins from <state>/plugins/*.wasm.
+            match rsd_wasm::PluginHost::new() {
+                Ok(mut host) => match host.load_dir(&state.join("plugins")) {
+                    Ok(n) if n > 0 => {
+                        eprintln!("wasm: {n} extractor plugin(s) loaded");
+                        indexer = indexer
+                            .with_wasm(Box::new(rsd_daemon::wasm_source::WasmExtractor::new(host)));
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("wasm: plugin load failed: {e}"),
+                },
+                Err(e) => eprintln!("wasm: host unavailable: {e}"),
+            }
             (Some(indexer), Some((plane, caes)))
         }
         Err(e) => {

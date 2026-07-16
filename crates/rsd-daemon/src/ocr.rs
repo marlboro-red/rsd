@@ -77,4 +77,12 @@ impl ContentSource for OcrExtractor {
             symbols: vec![],
         })
     }
+
+    fn handles(&self, name: &str) -> bool {
+        rsd_extract::is_image(name)
+    }
+
+    fn processor_tag(&self) -> &str {
+        "ocr"
+    }
 }

@@ -16,6 +16,7 @@ members = [
     "crates/rsd-vector",
     "crates/rsd-ml",
     "crates/rsd-metrics",
+    "crates/rsd-wasm",
     "crates/rsd-ipc",
     "crates/rsd-testkit",
     "crates/rsd-daemon",
@@ -43,10 +44,12 @@ rsd-live = { path = "crates/rsd-live" }
 rsd-vector = { path = "crates/rsd-vector" }
 rsd-ml = { path = "crates/rsd-ml" }
 rsd-metrics = { path = "crates/rsd-metrics" }
+rsd-wasm = { path = "crates/rsd-wasm" }
 rsd-ipc = { path = "crates/rsd-ipc" }
 
 blake3 = "1"
 tantivy = "0.24"
+wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime"] }
 serde_json = "1"
 candle-core = "0.9"
 candle-nn = "0.9"

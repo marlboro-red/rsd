@@ -58,9 +58,18 @@ impl ExtractHints {
 
     /// Canonical hash of extraction-relevant hints for CAES keying.
     pub fn hints_hash(&self, truncated: bool) -> [u8; 32] {
+        self.hints_hash_with(truncated, "")
+    }
+
+    /// As `hints_hash`, but discriminated by the *processor* that handled the
+    /// file (native / ocr / wasm:<plugin>). Two processors over identical bytes
+    /// produce different CAES records — so adding a plugin re-extracts rather
+    /// than serving the old default-path result.
+    pub fn hints_hash_with(&self, truncated: bool, processor: &str) -> [u8; 32] {
         let mut h = blake3_hasher();
         h.update(self.extension().as_bytes());
         h.update(&[truncated as u8]);
+        h.update(processor.as_bytes());
         *h.finalize().as_bytes()
     }
 }
