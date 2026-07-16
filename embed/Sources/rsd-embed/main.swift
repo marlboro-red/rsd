@@ -40,9 +40,14 @@ guard #available(macOS 14.0, *), let emb = NLContextualEmbedding(language: .engl
     exit(1)
 }
 if !emb.hasAvailableAssets {
+    // Bounded wait: on a headless machine assets may never arrive; give up and
+    // exit so the daemon falls back rather than hanging.
     let sem = DispatchSemaphore(value: 0)
     emb.requestAssets { _, _ in sem.signal() }
-    sem.wait()
+    if sem.wait(timeout: .now() + 30) == .timedOut {
+        FileHandle.standardError.write("rsd-embed: assets unavailable\n".data(using: .utf8)!)
+        exit(1)
+    }
 }
 do { try emb.load() } catch {
     FileHandle.standardError.write("rsd-embed: load failed: \(error)\n".data(using: .utf8)!)

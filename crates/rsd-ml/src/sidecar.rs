@@ -73,23 +73,42 @@ impl SidecarEmbedder {
             .stderr(Stdio::inherit())
             .spawn()?;
         let stdin = child.stdin.take().expect("piped");
-        let mut stdout = BufReader::new(child.stdout.take().expect("piped"));
-        // First line: "READY <dim>".
-        let mut line = String::new();
-        stdout.read_line(&mut line)?;
-        let dim = line
-            .trim()
-            .strip_prefix("READY ")
-            .and_then(|d| d.parse::<usize>().ok())
-            .ok_or_else(|| std::io::Error::other(format!("bad READY line: {line:?}")))?;
-        Ok((
-            Pipes {
-                child,
-                stdin,
-                stdout,
-            },
-            dim,
-        ))
+        let raw = child.stdout.take().expect("piped");
+
+        // Bounded READY handshake: a helper stuck loading (e.g. NL assets not
+        // present on a headless box) must never block us — read the first line
+        // on a thread and time out.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut stdout = BufReader::new(raw);
+            let mut line = String::new();
+            let r = stdout.read_line(&mut line);
+            let _ = tx.send(r.map(|_| (line, stdout)));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(Ok((line, stdout))) => {
+                let _ = reader.join();
+                let dim = line
+                    .trim()
+                    .strip_prefix("READY ")
+                    .and_then(|d| d.parse::<usize>().ok())
+                    .ok_or_else(|| std::io::Error::other(format!("bad READY line: {line:?}")))?;
+                Ok((
+                    Pipes {
+                        child,
+                        stdin,
+                        stdout,
+                    },
+                    dim,
+                ))
+            }
+            _ => {
+                let _ = child.kill();
+                Err(std::io::Error::other(
+                    "rsd-embed did not become ready in time",
+                ))
+            }
+        }
     }
 
     fn one_shot(pipes: &mut Pipes, text: &str, dim: usize) -> std::io::Result<Vec<f32>> {
