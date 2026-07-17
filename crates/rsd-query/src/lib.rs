@@ -505,19 +505,9 @@ impl<'a> QueryEngine<'a> {
             return Err(QueryError::NoLexicalPlane);
         }
 
-        let allowed_path = |path: &str| {
-            effective.as_ref().is_none_or(|scopes| {
-                scopes
-                    .iter()
-                    .any(|scope| Path::new(path).starts_with(scope))
-            })
-        };
         let bound = bind_text_sets(expr, &mut std::iter::empty());
         let mut count = 0u64;
-        for (path, _) in self.catalog.listing()? {
-            if !allowed_path(&path) {
-                continue;
-            }
+        for path in self.candidate_paths(effective.as_deref())? {
             let Some((oid, rec)) = self.catalog.get_by_path(&path)? else {
                 continue;
             };
@@ -548,7 +538,7 @@ impl<'a> QueryEngine<'a> {
 
         if let Expr::Semantic { query } = expr {
             let vp = self.vector.ok_or(QueryError::NoVectorPlane)?;
-            let allowed_oids = self.authorized_oids(&allowed_path)?;
+            let allowed_oids = self.authorized_oids(effective.as_deref())?;
             let hits = vp
                 .search_filtered(query, self.limit, |oid| allowed_oids.contains(&oid))
                 .map_err(|e| QueryError::Unsupported(e.to_string()))?;
@@ -592,7 +582,7 @@ impl<'a> QueryEngine<'a> {
             return Err(QueryError::NoLexicalPlane);
         }
 
-        let allowed_oids = self.authorized_oids(&allowed_path)?;
+        let allowed_oids = self.authorized_oids(effective.as_deref())?;
         let mut sets: Vec<HashSet<u64>> = Vec::new();
         collect_text_sets(
             expr,
@@ -605,10 +595,7 @@ impl<'a> QueryEngine<'a> {
         let expr = bind_text_sets(expr, &mut sets_iter);
 
         let mut hits = Vec::new();
-        for (path, _) in self.catalog.listing()? {
-            if !allowed_path(&path) {
-                continue;
-            }
+        for path in self.candidate_paths(effective.as_deref())? {
             let Some((oid, rec)) = self.catalog.get_by_path(&path)? else {
                 continue;
             };
@@ -625,13 +612,30 @@ impl<'a> QueryEngine<'a> {
         Ok(hits)
     }
 
-    fn authorized_oids(&self, allowed_path: &impl Fn(&str) -> bool) -> Result<HashSet<u64>> {
+    fn candidate_paths(&self, scopes: Option<&[PathBuf]>) -> Result<Vec<String>> {
+        let Some(scopes) = scopes else {
+            return Ok(self
+                .catalog
+                .listing()?
+                .into_keys()
+                .collect());
+        };
+        let mut paths = HashSet::new();
+        for scope in scopes {
+            for path in self.catalog.subtree_paths(&scope.to_string_lossy())? {
+                paths.insert(path);
+            }
+        }
+        let mut paths: Vec<String> = paths.into_iter().collect();
+        paths.sort_unstable();
+        Ok(paths)
+    }
+
+    fn authorized_oids(&self, scopes: Option<&[PathBuf]>) -> Result<HashSet<u64>> {
         let mut oids = HashSet::new();
-        for (path, _) in self.catalog.listing()? {
-            if allowed_path(&path) {
-                if let Some((oid, _)) = self.catalog.get_by_path(&path)? {
-                    oids.insert(oid);
-                }
+        for path in self.candidate_paths(scopes)? {
+            if let Some((oid, _)) = self.catalog.get_by_path(&path)? {
+                oids.insert(oid);
             }
         }
         Ok(oids)
@@ -987,6 +991,17 @@ impl<'a> QueryEngine<'a> {
 mod tests {
     use super::*;
 
+    fn stat(ino: u64) -> rsd_catalog::StatInfo {
+        rsd_catalog::StatInfo {
+            kind: ObjectKind::File,
+            file_id: rsd_catalog::FileId { dev: 1, ino },
+            size: 1,
+            mtime_ns: 1,
+            birthtime_ns: ino as i64,
+            nlink: 1,
+        }
+    }
+
     #[test]
     fn grammar_corpus_parses() {
         let corpus = [
@@ -1005,6 +1020,46 @@ mod tests {
         for q in corpus {
             parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
         }
+    }
+
+    #[test]
+    fn scoped_catalog_counts_enumerate_grant_subtrees_without_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(&tmp.path().join("catalog.redb")).unwrap();
+        catalog
+            .apply_changes_direct(&[
+                rsd_catalog::Change::Upsert {
+                    path: "/grant/a.txt".into(),
+                    stat: stat(1),
+                },
+                rsd_catalog::Change::Upsert {
+                    path: "/grant/sub/b.txt".into(),
+                    stat: stat(2),
+                },
+                rsd_catalog::Change::Upsert {
+                    path: "/grant-two/private.txt".into(),
+                    stat: stat(3),
+                },
+            ])
+            .unwrap();
+        let engine = QueryEngine {
+            catalog: &catalog,
+            lexical: None,
+            vector: None,
+            limit: 1,
+        };
+        let expr = parse("kMDItemFSSize > 0").unwrap();
+
+        assert_eq!(
+            engine
+                .count_authorized(
+                    &expr,
+                    None,
+                    &[PathBuf::from("/grant"), PathBuf::from("/grant/sub")],
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
