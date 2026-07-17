@@ -245,12 +245,19 @@ fn run_query(
         vector: vguard.as_deref(),
         limit: 10_000,
     };
-    let hits = engine.run(&expr, scope).map_err(|e| e.to_string())?;
-    // Enforcement before ANY output: counts and results alike are computed
-    // over the authorized subset only.
+    let hits = match authz_scope {
+        Scope::Unrestricted => engine.run(&expr, scope),
+        Scope::Paths(prefixes) => {
+            let grants: Vec<PathBuf> = prefixes
+                .iter()
+                .map(|prefix| prefix.as_path().to_path_buf())
+                .collect();
+            engine.run_authorized(&expr, scope, &grants)
+        }
+    }
+    .map_err(|e| e.to_string())?;
     Ok(hits
         .into_iter()
-        .filter(|h| authz_scope.allows(&h.path))
         .map(|h| Hit {
             oid: h.oid,
             path: h.path,

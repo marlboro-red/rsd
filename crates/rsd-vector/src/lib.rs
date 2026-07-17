@@ -387,12 +387,26 @@ impl VectorPlane {
     /// Exact cosine top-k: per-doc best chunk score. Normalized vectors =>
     /// dot product.
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<SemanticHit>> {
+        self.search_filtered(query, k, |_| true)
+    }
+
+    /// Exact cosine top-k with authorization applied before candidates enter
+    /// the ranked result set.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        allowed: impl Fn(u64) -> bool,
+    ) -> Result<Vec<SemanticHit>> {
         let qv = self.embedder.embed(query);
         let txn = self.db.begin_read()?;
         let table = txn.open_table(VECTORS)?;
         let mut hits: Vec<SemanticHit> = Vec::new();
         for item in table.iter()? {
             let (key, val) = item?;
+            if !allowed(key.value()) {
+                continue;
+            }
             let doc: DocVectors = postcard::from_bytes(val.value())?;
             if doc.embedder_id != self.embedder.id()
                 || doc.embedder_version != self.embedder.version()

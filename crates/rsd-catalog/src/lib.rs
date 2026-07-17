@@ -145,12 +145,13 @@ pub struct ObjectRecord {
     pub caes_hints_hash: Option<[u8; 32]>,
 }
 
-/// Current content identity for one live catalog object, with one path used to
-/// resolve it during disposable-plane reconstruction.
+/// Current content identity for one live catalog object. All paths are kept so
+/// disposable projections can derive component-safe authorization terms while
+/// still deduplicating content by oid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentBinding {
     pub oid: u64,
-    pub path: String,
+    pub paths: Vec<String>,
     pub content_hash: [u8; 32],
     pub hints_hash: [u8; 32],
 }
@@ -650,7 +651,7 @@ impl Catalog {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for item in by_path.iter()? {
-            let (path, oid) = item?;
+            let (_, oid) = item?;
             let oid = oid.value();
             if !seen.insert(oid) {
                 continue;
@@ -666,7 +667,7 @@ impl Catalog {
             };
             out.push(ContentBinding {
                 oid,
-                path: path.value().to_string(),
+                paths: record.entry_paths.clone(),
                 content_hash,
                 hints_hash,
             });

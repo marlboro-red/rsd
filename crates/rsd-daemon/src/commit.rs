@@ -151,11 +151,19 @@ impl Committer {
         let (first, last) = self.journal.append(source, changes)?;
         let deltas = self.catalog.apply_changes(first, changes)?;
         let remove_oids = self.projection_removals(&deltas)?;
+        let refresh_oids = projection_updates(&deltas);
         if let Some((plane, caes)) = self.lexical.as_mut() {
             let apply = if plane.applied_lsn().saturating_add(1) < first {
                 plane.rebuild_current(last, &self.catalog, caes)
             } else {
-                plane.apply(first, changes, &remove_oids, &self.catalog, caes)
+                plane.apply(
+                    first,
+                    changes,
+                    &remove_oids,
+                    &refresh_oids,
+                    &self.catalog,
+                    caes,
+                )
             };
             if let Err(error) = apply {
                 tracing::error!("lexical apply failed; rebuilding projection: {error}");
@@ -300,6 +308,19 @@ impl Committer {
     pub fn journal_max_lsn(&self) -> u64 {
         self.journal.max_lsn()
     }
+}
+
+fn projection_updates(deltas: &[rsd_catalog::Delta]) -> Vec<u64> {
+    let mut updates = HashSet::new();
+    for delta in deltas {
+        if let Some((oid, _)) = &delta.old {
+            updates.insert(*oid);
+        }
+        if let Some((oid, _)) = &delta.new {
+            updates.insert(*oid);
+        }
+    }
+    updates.into_iter().collect()
 }
 
 /// Deterministic synthetic workload shared by the crash-injection harness and

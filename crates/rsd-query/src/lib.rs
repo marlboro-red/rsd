@@ -21,6 +21,7 @@
 use rsd_catalog::{Catalog, ObjectKind, ObjectRecord};
 use rsd_lexical::LexicalReader;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 pub const GRAMMAR_VERSION: u32 = 1;
 
@@ -446,38 +447,74 @@ impl<'a> QueryEngine<'a> {
     }
 
     pub fn run(&self, expr: &Expr, scope: Option<&str>) -> Result<Vec<Hit>> {
-        // Fast path: pure semantic query => vector plane, rank order kept.
-        if let (Expr::Semantic { query }, None) = (expr, scope) {
+        self.run_with_scopes(expr, scope, None)
+    }
+
+    /// Apply grants inside lexical/vector candidate generation and catalog
+    /// enumeration. The optional caller scope only narrows these grants.
+    pub fn run_authorized(
+        &self,
+        expr: &Expr,
+        scope: Option<&str>,
+        grants: &[PathBuf],
+    ) -> Result<Vec<Hit>> {
+        self.run_with_scopes(expr, scope, Some(grants))
+    }
+
+    fn run_with_scopes(
+        &self,
+        expr: &Expr,
+        requested_scope: Option<&str>,
+        grants: Option<&[PathBuf]>,
+    ) -> Result<Vec<Hit>> {
+        let effective = effective_scopes(requested_scope, grants);
+        if effective.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        let allowed_path = |path: &str| {
+            effective.as_ref().is_none_or(|scopes| {
+                scopes
+                    .iter()
+                    .any(|scope| Path::new(path).starts_with(scope))
+            })
+        };
+
+        if let Expr::Semantic { query } = expr {
             let vp = self.vector.ok_or(QueryError::NoVectorPlane)?;
+            let allowed_oids = self.authorized_oids(&allowed_path)?;
             let hits = vp
-                .search(query, self.limit)
+                .search_filtered(query, self.limit, |oid| allowed_oids.contains(&oid))
                 .map_err(|e| QueryError::Unsupported(e.to_string()))?;
             let mut out = Vec::with_capacity(hits.len());
-            for h in hits {
-                if let Some(rec) = self.catalog.get_object(h.oid)? {
-                    if let Some(p) = rec.entry_paths.first() {
+            for hit in hits {
+                if let Some(record) = self.catalog.get_object(hit.oid)? {
+                    if let Some(path) = record.entry_paths.iter().find(|p| allowed_path(p)) {
                         out.push(Hit {
-                            oid: h.oid,
-                            path: p.clone(),
+                            oid: hit.oid,
+                            path: path.clone(),
                         });
                     }
                 }
             }
             return Ok(out);
         }
-        // Fast path: pure text query, no scope => lexical plane directly.
-        if let (Expr::Text { terms }, None) = (expr, scope) {
-            let lex = self.lexical.ok_or(QueryError::NoLexicalPlane)?;
-            let oids = lex.search_content(terms, false, self.limit)?;
+
+        if let Expr::Text { terms } = expr {
+            let lexical = self.lexical.ok_or(QueryError::NoLexicalPlane)?;
+            let oids = match &effective {
+                Some(scopes) => {
+                    let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
+                    lexical.search_content_scoped(terms, false, &refs, self.limit)?
+                }
+                None => lexical.search_content(terms, false, self.limit)?,
+            };
             let mut hits = Vec::with_capacity(oids.len());
             for oid in oids {
-                // Liveness + path resolution through the catalog: renamed
-                // files answer with their CURRENT path; dead oids drop out.
-                if let Some(rec) = self.catalog.get_object(oid)? {
-                    if let Some(p) = rec.entry_paths.first() {
+                if let Some(record) = self.catalog.get_object(oid)? {
+                    if let Some(path) = record.entry_paths.iter().find(|p| allowed_path(p)) {
                         hits.push(Hit {
                             oid,
-                            path: p.clone(),
+                            path: path.clone(),
                         });
                     }
                 }
@@ -485,19 +522,24 @@ impl<'a> QueryEngine<'a> {
             return Ok(hits);
         }
 
-        // General path: pre-resolve every text predicate to an oid set, then
-        // scan the (scoped) catalog evaluating the expression per entry.
+        let allowed_oids = self.authorized_oids(&allowed_path)?;
         let mut sets: Vec<HashSet<u64>> = Vec::new();
-        collect_text_sets(expr, self.lexical, self.vector, self.limit, &mut sets)?;
+        collect_text_sets(
+            expr,
+            self.lexical,
+            self.vector,
+            self.limit,
+            effective.as_deref(),
+            &allowed_oids,
+            &mut sets,
+        )?;
         let mut sets_iter = sets.into_iter();
         let expr = bind_text_sets(expr, &mut sets_iter);
 
         let mut hits = Vec::new();
         for (path, _) in self.catalog.listing()? {
-            if let Some(prefix) = scope {
-                if !path.starts_with(&format!("{}/", prefix.trim_end_matches('/'))) {
-                    continue;
-                }
+            if !allowed_path(&path) {
+                continue;
             }
             let Some((oid, rec)) = self.catalog.get_by_path(&path)? else {
                 continue;
@@ -513,6 +555,38 @@ impl<'a> QueryEngine<'a> {
             }
         }
         Ok(hits)
+    }
+
+    fn authorized_oids(&self, allowed_path: &impl Fn(&str) -> bool) -> Result<HashSet<u64>> {
+        let mut oids = HashSet::new();
+        for (path, _) in self.catalog.listing()? {
+            if allowed_path(&path) {
+                if let Some((oid, _)) = self.catalog.get_by_path(&path)? {
+                    oids.insert(oid);
+                }
+            }
+        }
+        Ok(oids)
+    }
+}
+
+fn effective_scopes(requested: Option<&str>, grants: Option<&[PathBuf]>) -> Option<Vec<PathBuf>> {
+    let requested = requested.map(PathBuf::from);
+    match (requested, grants) {
+        (None, None) => None,
+        (Some(scope), None) => Some(vec![scope]),
+        (None, Some(grants)) => Some(grants.to_vec()),
+        (Some(requested), Some(grants)) => {
+            let mut scopes = HashSet::new();
+            for grant in grants {
+                if requested.starts_with(grant) {
+                    scopes.insert(requested.clone());
+                } else if grant.starts_with(&requested) {
+                    scopes.insert(grant.clone());
+                }
+            }
+            Some(scopes.into_iter().collect())
+        }
     }
 }
 
@@ -545,27 +619,32 @@ fn collect_text_sets(
     lex: Option<&LexicalReader>,
     vector: Option<&rsd_vector::VectorPlane>,
     limit: usize,
+    path_scopes: Option<&[PathBuf]>,
+    allowed_oids: &HashSet<u64>,
     out: &mut Vec<HashSet<u64>>,
 ) -> Result<()> {
     match e {
         Expr::And(v) | Expr::Or(v) => {
             for x in v {
-                collect_text_sets(x, lex, vector, limit, out)?;
+                collect_text_sets(x, lex, vector, limit, path_scopes, allowed_oids, out)?;
             }
         }
-        Expr::Not(b) => collect_text_sets(b, lex, vector, limit, out)?,
+        Expr::Not(b) => collect_text_sets(b, lex, vector, limit, path_scopes, allowed_oids, out)?,
         Expr::Text { terms } => {
             let lex = lex.ok_or(QueryError::NoLexicalPlane)?;
-            out.push(
-                lex.search_content(terms, false, limit.max(65_536))?
-                    .into_iter()
-                    .collect(),
-            );
+            let oids = match path_scopes {
+                Some(scopes) => {
+                    let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
+                    lex.search_content_scoped(terms, false, &refs, limit.max(65_536))?
+                }
+                None => lex.search_content(terms, false, limit.max(65_536))?,
+            };
+            out.push(oids.into_iter().collect());
         }
         Expr::Semantic { query } => {
             let vp = vector.ok_or(QueryError::NoVectorPlane)?;
             out.push(
-                vp.search(query, limit.max(256))
+                vp.search_filtered(query, limit.max(256), |oid| allowed_oids.contains(&oid))
                     .map_err(|e| QueryError::Unsupported(e.to_string()))?
                     .into_iter()
                     .map(|h| h.oid)
@@ -578,11 +657,14 @@ fn collect_text_sets(
             ..
         } => {
             let lex = lex.ok_or(QueryError::NoLexicalPlane)?;
-            out.push(
-                lex.search_content(text, false, limit.max(65_536))?
-                    .into_iter()
-                    .collect(),
-            );
+            let oids = match path_scopes {
+                Some(scopes) => {
+                    let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
+                    lex.search_content_scoped(text, false, &refs, limit.max(65_536))?
+                }
+                None => lex.search_content(text, false, limit.max(65_536))?,
+            };
+            out.push(oids.into_iter().collect());
         }
         Expr::Cmp {
             attr: Attr::Symbols,
@@ -590,11 +672,14 @@ fn collect_text_sets(
             ..
         } => {
             let lex = lex.ok_or(QueryError::NoLexicalPlane)?;
-            out.push(
-                lex.search_symbols(text, limit.max(65_536))?
-                    .into_iter()
-                    .collect(),
-            );
+            let oids = match path_scopes {
+                Some(scopes) => {
+                    let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
+                    lex.search_symbols_scoped(text, &refs, limit.max(65_536))?
+                }
+                None => lex.search_symbols(text, limit.max(65_536))?,
+            };
+            out.push(oids.into_iter().collect());
         }
         _ => {}
     }
@@ -851,5 +936,22 @@ mod tests {
         assert!(glob_match("README*", "readme.md", true));
         assert!(!glob_match("README*", "readme.md", false));
         assert!(glob_match("*inv*ce*", "my-invoice.pdf", false));
+    }
+
+    #[test]
+    fn requested_scope_intersects_grants_by_components() {
+        let grants = vec![PathBuf::from("/root/docs")];
+        assert_eq!(
+            effective_scopes(Some("/root/docs/reports"), Some(&grants)),
+            Some(vec![PathBuf::from("/root/docs/reports")])
+        );
+        assert_eq!(
+            effective_scopes(Some("/root"), Some(&grants)),
+            Some(vec![PathBuf::from("/root/docs")])
+        );
+        assert_eq!(
+            effective_scopes(Some("/root/docs-private"), Some(&grants)),
+            Some(Vec::new())
+        );
     }
 }

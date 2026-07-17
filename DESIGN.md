@@ -667,9 +667,12 @@ visibility; it grants it explicitly.
   component-boundary-safe and deny-by-default, including unknown principals and
   explicit empty grants. Its `Hello` principal remains caller-asserted, so the
   daemon configures no UDS grants; verified first-party identity, persistent grant
-  management, and candidate-generation enforcement remain T0 targets. The
+  management, and dynamic revocation remain T0 targets. Lexical documents carry
+  non-stored component-ancestor scope terms, catalog enumeration is scope-first,
+  and the exact-scan semantic plane filters oids before ranking. Exact counts above
+  the current query cap and statistical timing tests remain unfinished. The
   token-authenticated loopback UI surface is separate.
-- **Enforcement point**: scope filters constrain **candidate generation**, not final
+- **Enforcement-point target**: scope filters constrain **candidate generation**, not final
   results — counts, aggregates, group-bys, rank positions, snippets, and live-view
   deltas are computed over the authorized subset only. Provenance traversal clips at
   scope boundaries: edges into unauthorized documents are invisible, not

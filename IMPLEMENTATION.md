@@ -201,8 +201,13 @@ extraction, no query engine yet — correctness of observation only.
   counts, initial subscription state, and live deltas.
 - The `Hello` principal is still caller-asserted. The shipped daemon therefore
   configures no UDS grants; XPC audit-token identity, persistent/user-visible grant
-  management, dynamic revocation re-fencing, candidate-generation enforcement,
-  aggregates, and statistical timing tests remain T0 targets.
+  management, dynamic revocation re-fencing, aggregates/exact counts above the
+  query cap, and statistical timing tests remain T0 targets.
+- Lexical authorization is enforced inside Tantivy candidate generation through
+  exact component-ancestor terms refreshed on rename/unlink/hard-link changes.
+  Catalog scans enumerate only intersected grants, and semantic exact-scan filters
+  unauthorized oids before ranking. A limit=1 regression proves unauthorized rank
+  positions cannot consume the scoped lexical budget.
 - Both UDS and loopback HTTP listeners cap active connection threads; excess peers
   are rejected. Pre-auth handshakes time out, IPC frames and HTTP headers are
   bounded, and search limits are clamped.

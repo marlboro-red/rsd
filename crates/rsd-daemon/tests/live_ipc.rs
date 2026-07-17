@@ -361,6 +361,65 @@ fn incremental_members_equal_fresh_query_after_storm() {
     env.pipeline.stop();
 }
 
+#[test]
+fn lexical_candidates_are_scope_constrained_and_unlink_refreshes_terms() {
+    let env = setup(AuthzStore::default());
+    let a = env.root.join("a");
+    let b = env.root.join("b");
+    let reader = LexicalReader::open(&env.base.join("lexical")).unwrap();
+    let a_hits = reader
+        .search_content_scoped("secret", false, &[a.as_path()], 1)
+        .unwrap();
+    let b_hits = reader
+        .search_content_scoped("secret", false, &[b.as_path()], 1)
+        .unwrap();
+    assert_eq!(a_hits.len(), 1);
+    assert_eq!(b_hits.len(), 1);
+    assert_ne!(a_hits, b_hits, "limit=1 must be spent inside each grant");
+
+    let outside = b.join("shared.txt");
+    let inside = a.join("shared.txt");
+    std::fs::write(&outside, "hardlink authorization marker").unwrap();
+    std::fs::hard_link(&outside, &inside).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let reader = LexicalReader::open(&env.base.join("lexical")).unwrap();
+        if !reader
+            .search_content_scoped("authorization marker", false, &[a.as_path()], 10)
+            .unwrap()
+            .is_empty()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "hard link never entered scope");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    std::fs::remove_file(&inside).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let reader = LexicalReader::open(&env.base.join("lexical")).unwrap();
+        let hits = reader
+            .search_content_scoped("authorization marker", false, &[a.as_path()], 10)
+            .unwrap();
+        if hits.is_empty()
+            && env
+                .cat
+                .get_by_path(&inside.to_string_lossy())
+                .unwrap()
+                .is_none()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "removed hard-link scope term remained searchable: {hits:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    env.pipeline.stop();
+}
+
 fn initial_oids(env: &Env, expr: &rsd_query::Expr) -> Vec<u64> {
     let reader = LexicalReader::open(&env.base.join("lexical")).unwrap();
     let engine = rsd_query::QueryEngine {

@@ -1,10 +1,10 @@
 //! rsd-lexical: the tantivy full-text plane (P4.1, DESIGN.md §6.4).
 //!
-//! Projection discipline: documents are keyed by catalog oid and store NO
-//! paths or names — results resolve to paths through the catalog at query
-//! time, so a rename can never serve a stale path. The plane is rebuildable
-//! from journal + CAES with zero filesystem reads (failure matrix §6.8), and
-//! carries its own applied-LSN watermark in tantivy's commit payload.
+//! Projection discipline: documents are keyed by catalog oid. Stored results
+//! still resolve paths through the catalog, so a rename can never serve a stale
+//! path. The index additionally carries non-stored component-ancestor terms
+//! used only to constrain authorized candidate generation. Rename/unlink
+//! commits refresh those terms from the catalog's current hard-link set.
 
 use rsd_caes::{CaesKey, Store, ABI_VERSION};
 use rsd_catalog::{Catalog, Change};
@@ -40,6 +40,7 @@ pub struct LexicalReader {
     f_oid: Field,
     f_content: Field,
     f_symbols: Field,
+    f_path_scope: Field,
 }
 
 pub struct LexicalPlane {
@@ -56,6 +57,9 @@ fn schema() -> Schema {
     // exactly — the default tokenizer would split them on `_`. One value per
     // symbol, lowercased at both index and query time.
     b.add_text_field("symbols", STRING);
+    // Each current path contributes itself and every component ancestor. A
+    // grant is therefore an exact TermQuery, not a vulnerable string prefix.
+    b.add_text_field("path_scope", STRING);
     b.build()
 }
 
@@ -71,6 +75,7 @@ impl LexicalReader {
             f_oid: s.get_field("oid").expect("schema"),
             f_content: s.get_field("content").expect("schema"),
             f_symbols: s.get_field("symbols").expect("schema"),
+            f_path_scope: s.get_field("path_scope").expect("schema"),
             reader,
             index,
         })
@@ -112,6 +117,7 @@ impl LexicalPlane {
         first_lsn: u64,
         changes: &[Change],
         remove_oids: &[u64],
+        refresh_oids: &[u64],
         catalog: &Catalog,
         caes: &Store,
     ) -> Result<()> {
@@ -120,49 +126,18 @@ impl LexicalPlane {
             self.writer
                 .delete_term(Term::from_field_u64(self.reader.f_oid, *oid));
         }
+        let mut refresh: std::collections::HashSet<u64> = refresh_oids.iter().copied().collect();
         for (i, ch) in changes.iter().enumerate() {
             let lsn = first_lsn + i as u64;
             if lsn <= self.applied_lsn {
                 continue;
             }
-            if let Change::Upsert { path, .. } = ch {
-                if let Some((oid, rec)) = catalog.get_by_path(path)? {
-                    if rec.content_hash.is_none() {
-                        self.writer
-                            .delete_term(Term::from_field_u64(self.reader.f_oid, oid));
-                    }
-                }
+            if let Some((oid, _)) = catalog.get_by_path(ch.path())? {
+                refresh.insert(oid);
             }
-            if let Change::SetContent {
-                path,
-                content_hash,
-                hints_hash,
-                ..
-            } = ch
-            {
-                let Some((oid, _)) = catalog.get_by_path(path)? else {
-                    continue;
-                };
-                let key = CaesKey {
-                    content_hash: *content_hash,
-                    extractor_id: rsd_extract::EXTRACTOR_ID.into(),
-                    extractor_version: rsd_extract::EXTRACTOR_VERSION,
-                    hints_hash: *hints_hash,
-                    abi_version: ABI_VERSION,
-                };
-                let Some(rec) = caes.get(&key)? else {
-                    continue;
-                };
-                self.writer
-                    .delete_term(Term::from_field_u64(self.reader.f_oid, oid));
-                let mut doc = TantivyDocument::default();
-                doc.add_u64(self.reader.f_oid, oid);
-                doc.add_text(self.reader.f_content, &rec.text);
-                for sym in &rec.symbols {
-                    doc.add_text(self.reader.f_symbols, sym.name.to_lowercase());
-                }
-                self.writer.add_document(doc)?;
-            }
+        }
+        for oid in refresh {
+            self.refresh_document(oid, catalog, caes)?;
         }
         if last > self.applied_lsn {
             let mut prepared = self.writer.prepare_commit()?;
@@ -171,6 +146,37 @@ impl LexicalPlane {
             self.reader.reader.reload()?;
             self.applied_lsn = self.applied_lsn.max(last);
         }
+        Ok(())
+    }
+
+    fn refresh_document(&mut self, oid: u64, catalog: &Catalog, caes: &Store) -> Result<()> {
+        self.writer
+            .delete_term(Term::from_field_u64(self.reader.f_oid, oid));
+        let Some(object) = catalog.get_object(oid)? else {
+            return Ok(());
+        };
+        let (Some(content_hash), Some(hints_hash)) = (object.content_hash, object.caes_hints_hash)
+        else {
+            return Ok(());
+        };
+        let Some(record) = caes.get(&CaesKey {
+            content_hash,
+            extractor_id: rsd_extract::EXTRACTOR_ID.into(),
+            extractor_version: rsd_extract::EXTRACTOR_VERSION,
+            hints_hash,
+            abi_version: ABI_VERSION,
+        })?
+        else {
+            return Ok(());
+        };
+        let mut doc = TantivyDocument::default();
+        doc.add_u64(self.reader.f_oid, oid);
+        doc.add_text(self.reader.f_content, &record.text);
+        for symbol in &record.symbols {
+            doc.add_text(self.reader.f_symbols, symbol.name.to_lowercase());
+        }
+        add_path_scopes(&mut doc, self.reader.f_path_scope, &object.entry_paths);
+        self.writer.add_document(doc)?;
         Ok(())
     }
 
@@ -226,6 +232,7 @@ impl LexicalPlane {
             for symbol in &record.symbols {
                 doc.add_text(self.reader.f_symbols, symbol.name.to_lowercase());
             }
+            add_path_scopes(&mut doc, self.reader.f_path_scope, &binding.paths);
             self.writer.add_document(doc)?;
         }
         let mut prepared = self.writer.prepare_commit()?;
@@ -248,6 +255,20 @@ impl LexicalPlane {
 
     pub fn doc_count(&self) -> Result<u64> {
         self.reader.doc_count()
+    }
+}
+
+fn add_path_scopes(doc: &mut TantivyDocument, field: Field, paths: &[String]) {
+    let mut scopes = std::collections::HashSet::new();
+    for path in paths {
+        for ancestor in Path::new(path).ancestors() {
+            if !ancestor.as_os_str().is_empty() {
+                scopes.insert(ancestor.to_string_lossy().into_owned());
+            }
+        }
+    }
+    for scope in scopes {
+        doc.add_text(field, scope);
     }
 }
 
@@ -293,9 +314,68 @@ impl LexicalReader {
         self.search_field(self.f_content, terms, phrase, limit)
     }
 
+    pub fn search_content_scoped(
+        &self,
+        terms: &str,
+        phrase: bool,
+        scopes: &[&Path],
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        self.search_field_scoped(self.f_content, terms, phrase, scopes, limit)
+    }
+
     /// Symbol search → matching oids.
     pub fn search_symbols(&self, terms: &str, limit: usize) -> Result<Vec<u64>> {
         self.search_field(self.f_symbols, terms, false, limit)
+    }
+
+    pub fn search_symbols_scoped(
+        &self,
+        terms: &str,
+        scopes: &[&Path],
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        self.search_field_scoped(self.f_symbols, terms, false, scopes, limit)
+    }
+
+    fn search_field_scoped(
+        &self,
+        field: Field,
+        terms: &str,
+        phrase: bool,
+        scopes: &[&Path],
+        limit: usize,
+    ) -> Result<Vec<u64>> {
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(content) = self.field_query(field, terms, phrase) else {
+            return Ok(Vec::new());
+        };
+        let mut unique = std::collections::HashSet::new();
+        let scope_queries: Vec<(Occur, Box<dyn Query>)> = scopes
+            .iter()
+            .filter_map(|scope| {
+                let text = scope.to_string_lossy().into_owned();
+                unique.insert(text.clone()).then(|| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(self.f_path_scope, &text),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    )
+                })
+            })
+            .collect();
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, content),
+            (
+                Occur::Must,
+                Box::new(BooleanQuery::new(scope_queries)) as Box<dyn Query>,
+            ),
+        ]);
+        self.search_query(&query, limit)
     }
 
     fn search_field(
@@ -308,8 +388,12 @@ impl LexicalReader {
         let Some(query) = self.field_query(field, terms, phrase) else {
             return Ok(vec![]);
         };
+        self.search_query(query.as_ref(), limit)
+    }
+
+    fn search_query(&self, query: &dyn Query, limit: usize) -> Result<Vec<u64>> {
         let searcher = self.reader.searcher();
-        let top = searcher.search(&query, &TopDocs::with_limit(limit.max(1)))?;
+        let top = searcher.search(query, &TopDocs::with_limit(limit.max(1)))?;
         let mut out = Vec::with_capacity(top.len());
         for (_score, addr) in top {
             let doc: TantivyDocument = searcher.doc(addr)?;
@@ -338,14 +422,6 @@ pub fn rebuild(
         std::fs::remove_dir_all(dir)?;
     }
     let mut plane = LexicalPlane::open(dir)?;
-    let mut batch: Vec<(u64, Change)> = Vec::new();
-    journal
-        .replay(1, |rec| batch.push((rec.lsn, rec.change)))
-        .map_err(|e| std::io::Error::other(format!("journal replay: {e}")))?;
-    for chunk in batch.chunks(4096) {
-        let first = chunk[0].0;
-        let changes: Vec<Change> = chunk.iter().map(|(_, c)| c.clone()).collect();
-        plane.apply(first, &changes, &[], catalog, caes)?;
-    }
+    plane.rebuild_current(journal.max_lsn(), catalog, caes)?;
     Ok(plane)
 }
