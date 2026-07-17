@@ -1,0 +1,19 @@
+[package]
+name = "rsd-transcribe"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone (own workspace) so whisper.cpp's C++ build never enters the fast
+# `cargo test --workspace` gate. Built by build-app.sh and the release job.
+[workspace]
+
+[[bin]]
+name = "rsd-transcribe"
+path = "src/main.rs"
+
+[dependencies]
+whisper-rs = "0.14"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "wav", "flac", "pcm"] }
+
+[profile.release]
+opt-level = 3

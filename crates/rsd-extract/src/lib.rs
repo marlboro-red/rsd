@@ -100,6 +100,18 @@ pub fn is_image(name: &str) -> bool {
     )
 }
 
+/// Audio/video containers the transcription helper can decode (symphonia).
+pub fn is_media(name: &str) -> bool {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "mp3" | "m4a" | "mp4" | "m4v" | "mov" | "wav" | "flac" | "aac"
+    )
+}
+
 /// Sniff by extension first, then content shape.
 pub fn sniff(hints: &ExtractHints, bytes: &[u8]) -> Format {
     if bytes.starts_with(b"%PDF-") || hints.extension() == "pdf" {

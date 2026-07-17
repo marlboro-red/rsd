@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod http;
 pub mod ipc;
 pub mod ocr;
+pub mod transcribe;
 pub mod wasm_source;
 
 pub use commit::{CommitError, Committer};

@@ -221,10 +221,12 @@ watermarks.
 
 ## Phase 7 — Platform surfaces [T1]
 
-**P7.1 — PDF + OCR + media pipeline [~]** (PDF text extraction shipped; **Vision
-OCR shipped**: images route to the rsd-ocr helper, screenshots searchable by
-their pixel-text lexically AND semantically e2e, test in the gate. pdfium
-quality upgrade and whisper A/V transcription remain) (pdfium in-sandbox, Vision OCR, whisper
+**P7.1 — PDF + OCR + media pipeline [x]** — PDF text extraction; Vision OCR
+(screenshots searchable by pixel-text, gate-tested); **whisper A/V
+transcription** (rsd-transcribe: whisper.cpp + symphonia decode, separate
+process, headless, no auth prompts — chosen over Apple Speech which requires
+interactive TCC and hangs for a background daemon). Opt-in per design
+(RSD_TRANSCRIBE=1 + fetched model). pdfium quality upgrade remains. (pdfium in-sandbox, Vision OCR, whisper
 opt-in; power gating). Success: budget/status contract tests incl. adversarial
 archive set; battery gate verified via powermetrics protocol.
 **P7.2 — WASM extractor ABI** (WIT interface, fuel/memory/output budgets, EPUB

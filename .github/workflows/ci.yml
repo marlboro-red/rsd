@@ -47,6 +47,8 @@ jobs:
         run: |
           rustup target add wasm32-unknown-unknown
           cargo build --release --target wasm32-unknown-unknown --manifest-path plugins/subtitles/Cargo.toml
+      - name: Build transcription helper
+        run: cargo build --release --manifest-path transcribe/Cargo.toml
       - name: Assemble bundle
         run: |
           mkdir -p dist/bin
@@ -56,6 +58,7 @@ jobs:
           cp "$(cd embed && swift build -c release --show-bin-path)/rsd-embed" dist/bin/
           mkdir -p dist/plugins
           cp plugins/subtitles/target/wasm32-unknown-unknown/release/rsd_plugin_subtitles.wasm dist/plugins/
+          cp transcribe/target/release/rsd-transcribe dist/bin/
           cp scripts/fetch-model.sh dist/bin/
           tar -C dist -czf rsd-macos-arm64.tar.gz bin RSD.app
       - uses: actions/upload-artifact@v4

@@ -85,6 +85,13 @@ fn main() -> std::io::Result<()> {
                 }
                 None => eprintln!("ocr: disabled (rsd-ocr helper not found)"),
             }
+            match rsd_daemon::transcribe::TranscribeExtractor::discover() {
+                Some(t) => {
+                    eprintln!("media: A/V transcription enabled (whisper)");
+                    indexer = indexer.with_media(Box::new(t));
+                }
+                None => eprintln!("media: transcription off (set RSD_TRANSCRIBE=1 + fetch model)"),
+            }
             // WASM extractor plugins from <state>/plugins/*.wasm.
             match rsd_wasm::PluginHost::new() {
                 Ok(mut host) => match host.load_dir(&state.join("plugins")) {

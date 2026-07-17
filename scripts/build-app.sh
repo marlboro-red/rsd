@@ -7,6 +7,7 @@ swift build --package-path ocr -c release
 swift build --package-path embed -c release
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
 cargo build --release --target wasm32-unknown-unknown --manifest-path plugins/subtitles/Cargo.toml
+cargo build --release --manifest-path transcribe/Cargo.toml
 cd app
 swift build -c release
 APP=../dist/RSD.app
@@ -16,6 +17,7 @@ cp "$(swift build -c release --show-bin-path)/RSD" "$APP/Contents/MacOS/RSD"
 cp ../target/release/rsd-daemon ../target/release/rsd-worker "$APP/Contents/MacOS/"
 cp "$(cd ../ocr && swift build -c release --show-bin-path)/rsd-ocr" "$APP/Contents/MacOS/"
 cp "$(cd ../embed && swift build -c release --show-bin-path)/rsd-embed" "$APP/Contents/MacOS/"
+cp ../transcribe/target/release/rsd-transcribe "$APP/Contents/MacOS/"
 mkdir -p "$APP/Contents/Resources/plugins"
 cp ../plugins/subtitles/target/wasm32-unknown-unknown/release/rsd_plugin_subtitles.wasm "$APP/Contents/Resources/plugins/"
 cat > "$APP/Contents/Info.plist" <<'PLIST'

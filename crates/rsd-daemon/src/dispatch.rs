@@ -74,6 +74,7 @@ pub struct ContentIndexer {
     source: Box<dyn ContentSource>,
     ocr: Option<Box<dyn ContentSource>>,
     wasm: Option<Box<dyn ContentSource>>,
+    media: Option<Box<dyn ContentSource>>,
     caes: Arc<Store>,
     budgets: Budgets,
     failures: HashMap<[u8; 32], u32>,
@@ -103,6 +104,7 @@ impl ContentIndexer {
             source,
             ocr: None,
             wasm: None,
+            media: None,
             caes,
             budgets: Budgets::default(),
             failures: HashMap::new(),
@@ -124,6 +126,12 @@ impl ContentIndexer {
         self
     }
 
+    /// Attach the A/V transcription source (opt-in; see transcribe.rs).
+    pub fn with_media(mut self, media: Box<dyn ContentSource>) -> ContentIndexer {
+        self.media = Some(media);
+        self
+    }
+
     /// Pick the processor for a file: explicit plugin > OCR (images) > default.
     fn route(&mut self, name: &str) -> (&mut dyn ContentSource, String) {
         if self.wasm.as_ref().is_some_and(|w| w.handles(name)) {
@@ -135,6 +143,11 @@ impl ContentIndexer {
             let o = self.ocr.as_mut().unwrap();
             let tag = o.processor_tag().to_string();
             return (o.as_mut(), tag);
+        }
+        if self.media.as_ref().is_some_and(|m| m.handles(name)) {
+            let m = self.media.as_mut().unwrap();
+            let tag = m.processor_tag().to_string();
+            return (m.as_mut(), tag);
         }
         (self.source.as_mut(), String::new())
     }
@@ -193,6 +206,8 @@ impl ContentIndexer {
                 self.wasm.as_ref().unwrap().processor_tag().to_string()
             } else if self.ocr.as_ref().is_some_and(|o| o.handles(&hints.name)) {
                 self.ocr.as_ref().unwrap().processor_tag().to_string()
+            } else if self.media.as_ref().is_some_and(|m| m.handles(&hints.name)) {
+                self.media.as_ref().unwrap().processor_tag().to_string()
             } else {
                 String::new()
             }
