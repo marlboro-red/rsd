@@ -59,6 +59,9 @@ pub enum WorkKind {
 pub struct WorkItem {
     pub path: PathBuf,
     pub kind: WorkKind,
+    /// Source cursor that becomes durable only after this item and every item
+    /// before it in the work FIFO have been journaled.
+    pub source_cursor: Option<u64>,
 }
 
 /// Default exclusion set (DESIGN.md §14): dependency trees, VCS internals,
@@ -264,6 +267,7 @@ pub fn rescan(cat: &Catalog, path: &Path, recursive: bool) -> Result<ScanStats> 
         &WorkItem {
             path: path.to_path_buf(),
             kind,
+            source_cursor: None,
         },
     )
 }

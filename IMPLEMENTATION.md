@@ -95,8 +95,10 @@ extraction, no query engine yet — correctness of observation only.
   fsync-tmp + rename + parent-directory fsync; corrupt-reads-as-None so the
   failure direction is re-delivery).
 - Note: proven end-to-end via the synthetic-source crash harness; wiring the
-  daemon's FSEvents `sinceWhen` resume through the coalescer's pending window is
-  deferred to Phase 3 (startup bootstrap rescan covers correctness meanwhile).
+  daemon's FSEvents `sinceWhen` resume now ships. The coalescer attaches a cursor
+  only when its pending set empties, and the FIFO applier persists it after every
+  earlier derived commit. Missing/corrupt cursors capture a pre-bootstrap event ID,
+  so changes during bootstrap replay after the watcher starts.
 - Success: kill-restart test — events delivered between journal and cursor-advance
   are re-delivered and idempotently re-applied; zero lost transitions across 100
   randomized kill points.

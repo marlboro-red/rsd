@@ -143,6 +143,9 @@ impl EventFlags {
     pub fn renamed(&self) -> bool {
         self.0 & flags::ITEM_RENAMED != 0
     }
+    pub fn created(&self) -> bool {
+        self.0 & flags::ITEM_CREATED != 0
+    }
     pub fn is_dir(&self) -> bool {
         self.0 & flags::ITEM_IS_DIR != 0
     }

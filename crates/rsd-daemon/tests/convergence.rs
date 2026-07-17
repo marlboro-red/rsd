@@ -12,6 +12,7 @@
 use rsd_catalog::{Catalog, Durability};
 use rsd_daemon::{bring_up, PipelineConfig};
 use rsd_ingest::CoalescerConfig;
+use rsd_log::CursorStore;
 use rsd_testkit::{assert_converged, converged, gen_tree, Mutator};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -105,6 +106,31 @@ fn restart_reconciles_mutations_that_happened_while_stopped() {
     assert_converged(&catalog, &env.root);
     catalog.check_invariants().unwrap();
     pipeline.stop();
+}
+
+#[test]
+fn live_events_advance_the_durable_fsevents_cursor() {
+    let env = setup(0, 62);
+    let (pipeline, _) = bring_up(
+        env.cat.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        None,
+        None,
+        None,
+        fast_cfg(),
+    )
+    .unwrap();
+    std::fs::write(env.root.join("cursor-proof.txt"), "durable event").unwrap();
+    wait_converged(&env.cat, &env.root, Duration::from_secs(15));
+    pipeline.stop();
+
+    let cursor = CursorStore::new(&env.journal_dir.join("fsevents.cursor"));
+    assert!(
+        cursor.get().unwrap().is_some(),
+        "drained live work must persist its FSEvents fence"
+    );
 }
 
 /// Poll until the catalog converges to the filesystem or the deadline passes.

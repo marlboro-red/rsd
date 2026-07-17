@@ -20,6 +20,8 @@ pub struct IngestEvent {
     pub path: PathBuf,
     /// Source demanded a recursive rescan (e.g. kFSEventStreamEventFlagMustScanSubDirs).
     pub rescan_recursive: bool,
+    /// Durable-source position represented by this event, when applicable.
+    pub source_cursor: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +56,10 @@ pub struct Coalescer {
     pending: HashMap<PathBuf, Pending>,
     /// Collapses performed (observability + tests).
     pub collapses: u64,
+    /// Highest cursor observed since the last emitted fence. It is attached
+    /// only when the pending set empties, proving every earlier event is
+    /// represented by a FIFO work item before that fence.
+    fence_cursor: Option<u64>,
 }
 
 impl Coalescer {
@@ -62,6 +68,7 @@ impl Coalescer {
             cfg,
             pending: HashMap::new(),
             collapses: 0,
+            fence_cursor: None,
         }
     }
 
@@ -93,6 +100,7 @@ impl Coalescer {
     }
 
     pub fn observe(&mut self, ev: IngestEvent, now: Instant) {
+        self.fence_cursor = self.fence_cursor.max(ev.source_cursor);
         let kind = if ev.rescan_recursive {
             WorkKind::RescanRecursive
         } else {
@@ -126,21 +134,42 @@ impl Coalescer {
             })
             .map(|(k, _)| k.clone())
             .collect();
-        ready
+        let mut items: Vec<WorkItem> = ready
             .into_iter()
             .map(|path| {
                 let p = self.pending.remove(&path).expect("selected above");
-                WorkItem { path, kind: p.kind }
+                WorkItem {
+                    path,
+                    kind: p.kind,
+                    source_cursor: None,
+                }
             })
-            .collect()
+            .collect();
+        self.attach_fence_if_quiescent(&mut items);
+        items
     }
 
     /// Drain everything regardless of timers (shutdown path).
     pub fn drain_all(&mut self) -> Vec<WorkItem> {
-        self.pending
+        let mut items: Vec<WorkItem> = self
+            .pending
             .drain()
-            .map(|(path, p)| WorkItem { path, kind: p.kind })
-            .collect()
+            .map(|(path, p)| WorkItem {
+                path,
+                kind: p.kind,
+                source_cursor: None,
+            })
+            .collect();
+        self.attach_fence_if_quiescent(&mut items);
+        items
+    }
+
+    fn attach_fence_if_quiescent(&mut self, items: &mut [WorkItem]) {
+        if self.pending.is_empty() {
+            if let Some(last) = items.last_mut() {
+                last.source_cursor = self.fence_cursor.take();
+            }
+        }
     }
 }
 
@@ -206,6 +235,7 @@ mod tests {
         IngestEvent {
             path: PathBuf::from(p),
             rescan_recursive: false,
+            source_cursor: None,
         }
     }
 
@@ -247,6 +277,38 @@ mod tests {
     }
 
     #[test]
+    fn source_cursor_fences_only_after_all_older_pending_work() {
+        let mut co = Coalescer::new(cfg());
+        let t0 = Instant::now();
+        co.observe(
+            IngestEvent {
+                path: PathBuf::from("/r/older"),
+                rescan_recursive: false,
+                source_cursor: Some(10),
+            },
+            t0,
+        );
+        co.observe(
+            IngestEvent {
+                path: PathBuf::from("/r/newer"),
+                rescan_recursive: false,
+                source_cursor: Some(11),
+            },
+            t0 + Duration::from_millis(400),
+        );
+
+        let older = co.due(t0 + Duration::from_millis(550));
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].path, Path::new("/r/older"));
+        assert_eq!(older[0].source_cursor, None);
+
+        let newer = co.due(t0 + Duration::from_millis(951));
+        assert_eq!(newer.len(), 1);
+        assert_eq!(newer[0].path, Path::new("/r/newer"));
+        assert_eq!(newer[0].source_cursor, Some(11));
+    }
+
+    #[test]
     fn recursive_flag_escalates_and_merge_takes_max() {
         let mut co = Coalescer::new(cfg());
         let t0 = Instant::now();
@@ -255,6 +317,7 @@ mod tests {
             IngestEvent {
                 path: PathBuf::from("/r/a"),
                 rescan_recursive: true,
+                source_cursor: None,
             },
             t0,
         );

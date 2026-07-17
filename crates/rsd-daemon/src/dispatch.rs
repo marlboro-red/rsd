@@ -232,8 +232,9 @@ impl ContentIndexer {
 
     /// Content-index the file upserts of a just-committed batch, journaling
     /// one `SetContent` batch for whatever resolved.
-    pub fn process(&mut self, committer: &mut Committer, upserts: &[(String, StatInfo)]) {
+    pub fn process(&mut self, committer: &mut Committer, upserts: &[(String, StatInfo)]) -> bool {
         let mut out: Vec<Change> = Vec::new();
+        let mut succeeded = true;
         for (path, stat) in upserts {
             if stat.kind != ObjectKind::File {
                 continue;
@@ -241,14 +242,19 @@ impl ContentIndexer {
             match self.process_one(committer, path, stat) {
                 Ok(Some(ch)) => out.push(ch),
                 Ok(None) => {}
-                Err(e) => tracing::warn!("content indexing {path:?} failed: {e}"),
+                Err(e) => {
+                    succeeded = false;
+                    tracing::warn!("content indexing {path:?} failed: {e}");
+                }
             }
         }
         if !out.is_empty() {
             if let Err(e) = committer.commit(Source::Content, &out) {
+                succeeded = false;
                 tracing::error!("SetContent commit failed: {e}");
             }
         }
+        succeeded
     }
 
     fn process_one(

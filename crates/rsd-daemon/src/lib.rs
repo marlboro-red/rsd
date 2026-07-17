@@ -23,7 +23,7 @@ use rsd_fsevents::{WatchConfig, Watcher};
 use rsd_ingest::{
     coalesce, resolve_work, CoalescerConfig, IngestEvent, ScanStats, WorkItem, WorkKind,
 };
-use rsd_log::{Journal, JournalConfig, Source};
+use rsd_log::{CursorStore, Journal, JournalConfig, Source};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -95,12 +95,14 @@ impl Pipeline {
         committer: Committer,
         content: Option<ContentIndexer>,
         root: &Path,
+        resume_cursor: u64,
+        cursor_store: CursorStore,
         cfg: PipelineConfig,
     ) -> std::io::Result<Pipeline> {
         let (watcher, event_rx) = Watcher::start(
             &[root],
             WatchConfig {
-                since: None,
+                since: Some(resume_cursor),
                 latency: cfg.fsevents_latency,
                 capacity: cfg.event_capacity,
             },
@@ -123,11 +125,18 @@ impl Pipeline {
                     if rsd_ingest::excluded(&ev.path) {
                         continue;
                     }
-                    let recursive = ev.flags.must_scan_subdirs() || ev.flags.dropped();
+                    // A moved/created directory must remain recursive even if
+                    // an earlier root event already inserted the directory in
+                    // the catalog. Event delivery order must not downgrade
+                    // subtree discovery to a shallow known-dir probe.
+                    let recursive = ev.flags.must_scan_subdirs()
+                        || ev.flags.dropped()
+                        || (ev.flags.is_dir() && (ev.flags.created() || ev.flags.renamed()));
                     if ingest_tx
                         .send(IngestEvent {
                             path: ev.path,
                             rescan_recursive: recursive,
+                            source_cursor: Some(ev.event_id),
                         })
                         .is_err()
                     {
@@ -171,7 +180,15 @@ impl Pipeline {
                 .spawn(move || {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         run_applier(
-                            committer, content, work_rx, &counters, &stats, grace, overflow, &root,
+                            committer,
+                            content,
+                            work_rx,
+                            &counters,
+                            &stats,
+                            grace,
+                            overflow,
+                            &root,
+                            cursor_store,
                         )
                     }));
                     if result.is_err() {
@@ -219,6 +236,7 @@ fn run_applier(
     grace: Duration,
     overflow: Arc<AtomicBool>,
     root: &Path,
+    cursor_store: CursorStore,
 ) {
     let resolve_and_commit = |committer: &mut Committer,
                               content: &mut Option<ContentIndexer>,
@@ -236,16 +254,23 @@ fn run_applier(
                         rsd_metrics::metrics().commits.inc();
                         if let Some(indexer) = content.as_mut() {
                             let upserts = file_upserts(&changes);
-                            if !upserts.is_empty() {
-                                indexer.process(committer, &upserts);
+                            if !upserts.is_empty() && !indexer.process(committer, &upserts) {
+                                return false;
                             }
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => tracing::error!("commit({:?}) failed: {e}", item.path),
+                    Err(e) => {
+                        tracing::error!("commit({:?}) failed: {e}", item.path);
+                        return false;
+                    }
                 }
+                true
             }
-            Err(e) => tracing::warn!("resolve({:?}) failed: {e}", item.path),
+            Err(e) => {
+                tracing::warn!("resolve({:?}) failed: {e}", item.path);
+                false
+            }
         }
     };
 
@@ -261,6 +286,7 @@ fn run_applier(
                 &WorkItem {
                     path: root.to_path_buf(),
                     kind: WorkKind::RescanRecursive,
+                    source_cursor: None,
                 },
                 Source::Scan,
             );
@@ -278,7 +304,19 @@ fn run_applier(
                 // interactive fine).
                 let fine = item.kind == WorkKind::Probe;
                 let t0 = std::time::Instant::now();
-                resolve_and_commit(&mut committer, &mut content, &item, Source::FsEvents);
+                let applied =
+                    resolve_and_commit(&mut committer, &mut content, &item, Source::FsEvents);
+                // Recheck overflow at the durability edge: the callback may
+                // have shed an event while this item was applying. Advancing
+                // past it before the next-loop root rescan would lose that
+                // event on a crash.
+                if applied && !overflow.load(Ordering::Acquire) {
+                    if let Some(source_cursor) = item.source_cursor {
+                        if let Err(error) = cursor_store.set(source_cursor) {
+                            tracing::error!("source cursor advance failed: {error}");
+                        }
+                    }
+                }
                 if fine {
                     rsd_metrics::metrics()
                         .index_latency_ms
@@ -439,6 +477,7 @@ fn trickle_walk(
             .send(WorkItem {
                 path: dir,
                 kind: WorkKind::RescanShallow,
+                source_cursor: None,
             })
             .is_err()
         {
@@ -490,6 +529,11 @@ pub fn bring_up(
     live: Option<Arc<std::sync::Mutex<rsd_live::LiveEngine>>>,
     cfg: PipelineConfig,
 ) -> std::io::Result<(Pipeline, ScanStats)> {
+    let cursor_store = CursorStore::new(&journal_dir.join("fsevents.cursor"));
+    let resume_cursor = cursor_store
+        .get()
+        .map_err(|error| std::io::Error::other(format!("cursor read: {error}")))?
+        .unwrap_or_else(rsd_fsevents::current_event_id);
     let journal = Journal::open(
         journal_dir,
         JournalConfig {
@@ -522,7 +566,7 @@ pub fn bring_up(
     if cfg.trickle_bootstrap {
         // The walker inside Pipeline::start owns bootstrap; queries answer
         // immediately against whatever is already indexed.
-        let p = Pipeline::start(committer, content, root, cfg)?;
+        let p = Pipeline::start(committer, content, root, resume_cursor, cursor_store, cfg)?;
         return Ok((p, ScanStats::default()));
     }
 
@@ -532,6 +576,7 @@ pub fn bring_up(
         &WorkItem {
             path: root.to_path_buf(),
             kind: WorkKind::RescanRecursive,
+            source_cursor: None,
         },
     )
     .map_err(|e| std::io::Error::other(format!("bootstrap resolve: {e}")))?;
@@ -542,11 +587,11 @@ pub fn bring_up(
         if let Some(indexer) = content.as_mut() {
             let upserts = file_upserts(chunk);
             if !upserts.is_empty() {
-                indexer.process(&mut committer, &upserts);
+                let _ = indexer.process(&mut committer, &upserts);
             }
         }
     }
 
-    let p = Pipeline::start(committer, content, root, cfg)?;
+    let p = Pipeline::start(committer, content, root, resume_cursor, cursor_store, cfg)?;
     Ok((p, stats))
 }

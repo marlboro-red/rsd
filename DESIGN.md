@@ -286,11 +286,11 @@ LogRecord { lsn, wall_time, source: FsEvents|Sentinel|Scan|AntiEntropy|Repair,
             content_hash, evidence: EventId|ScanGeneration }
 ```
 
-- **Source-cursor fencing target**: FSEvents event IDs / ES sequence numbers advance
-  durably only after the derived records are journaled. `CursorStore` and the
-  synthetic-source crash proof ship, but the production FSEvents watcher currently
-  starts at `SINCE_NOW`; the restart bootstrap reconciliation is the correctness
-  fallback until the cursor is wired end to end.
+- **Source-cursor fencing**: FSEvents event IDs advance durably only after the
+  coalescer reaches a fence and all earlier FIFO work (including content commits)
+  is journaled. Startup resumes from that cursor; on a new/corrupt cursor it captures
+  a pre-bootstrap event ID and replays from there after reconciliation. ES sequence
+  fencing remains a future sentinel-tier concern.
 - The journal orders and describes transitions; it does **not** contain content
   (that's CAES) and does **not** claim complete observation of the filesystem
   (that's reconciliation's job).
