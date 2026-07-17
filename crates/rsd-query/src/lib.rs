@@ -461,6 +461,73 @@ impl<'a> QueryEngine<'a> {
         self.run_with_scopes(expr, scope, Some(grants))
     }
 
+    /// Count every matching result without inheriting the ranked-search limit.
+    pub fn count(&self, expr: &Expr, scope: Option<&str>) -> Result<u64> {
+        self.count_with_scopes(expr, scope, None)
+    }
+
+    pub fn count_authorized(
+        &self,
+        expr: &Expr,
+        scope: Option<&str>,
+        grants: &[PathBuf],
+    ) -> Result<u64> {
+        self.count_with_scopes(expr, scope, Some(grants))
+    }
+
+    fn count_with_scopes(
+        &self,
+        expr: &Expr,
+        requested_scope: Option<&str>,
+        grants: Option<&[PathBuf]>,
+    ) -> Result<u64> {
+        let effective = effective_scopes(requested_scope, grants);
+        if effective.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(0);
+        }
+        if contains_semantic(expr) {
+            return Err(QueryError::Unsupported(
+                "exact Count is undefined for ranked semantic predicates".into(),
+            ));
+        }
+
+        if let Expr::Text { terms } = expr {
+            let lexical = self.lexical.ok_or(QueryError::NoLexicalPlane)?;
+            return match &effective {
+                Some(scopes) => {
+                    let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
+                    Ok(lexical.count_content_scoped(terms, false, &refs)?)
+                }
+                None => Ok(lexical.count_content(terms, false)?),
+            };
+        }
+        if contains_lexical(expr) && self.lexical.is_none() {
+            return Err(QueryError::NoLexicalPlane);
+        }
+
+        let allowed_path = |path: &str| {
+            effective.as_ref().is_none_or(|scopes| {
+                scopes
+                    .iter()
+                    .any(|scope| Path::new(path).starts_with(scope))
+            })
+        };
+        let bound = bind_text_sets(expr, &mut std::iter::empty());
+        let mut count = 0u64;
+        for (path, _) in self.catalog.listing()? {
+            if !allowed_path(&path) {
+                continue;
+            }
+            let Some((oid, rec)) = self.catalog.get_by_path(&path)? else {
+                continue;
+            };
+            if rec.kind != ObjectKind::Dir && eval(&bound, oid, &path, &rec, self.lexical)? {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
     fn run_with_scopes(
         &self,
         expr: &Expr,
@@ -521,15 +588,16 @@ impl<'a> QueryEngine<'a> {
             }
             return Ok(hits);
         }
+        if contains_lexical(expr) && self.lexical.is_none() {
+            return Err(QueryError::NoLexicalPlane);
+        }
 
         let allowed_oids = self.authorized_oids(&allowed_path)?;
         let mut sets: Vec<HashSet<u64>> = Vec::new();
         collect_text_sets(
             expr,
-            self.lexical,
             self.vector,
             self.limit,
-            effective.as_deref(),
             &allowed_oids,
             &mut sets,
         )?;
@@ -547,7 +615,7 @@ impl<'a> QueryEngine<'a> {
             if rec.kind == ObjectKind::Dir {
                 continue;
             }
-            if eval(&expr, oid, &path, &rec) {
+            if eval(&expr, oid, &path, &rec, self.lexical)? {
                 hits.push(Hit { oid, path });
                 if hits.len() >= self.limit {
                     break;
@@ -603,6 +671,34 @@ fn count_text(e: &Expr) -> usize {
     }
 }
 
+fn contains_semantic(e: &Expr) -> bool {
+    match e {
+        Expr::And(v) | Expr::Or(v) => v.iter().any(contains_semantic),
+        Expr::Not(b) => contains_semantic(b),
+        Expr::Semantic { .. } => true,
+        _ => false,
+    }
+}
+
+fn contains_lexical(e: &Expr) -> bool {
+    match e {
+        Expr::And(v) | Expr::Or(v) => v.iter().any(contains_lexical),
+        Expr::Not(b) => contains_lexical(b),
+        Expr::Text { .. }
+        | Expr::Cmp {
+            attr: Attr::TextContent | Attr::Symbols,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LexicalField {
+    Content,
+    Symbols,
+}
+
 /// Bound expression: text predicates replaced by membership sets.
 #[derive(Debug, Clone)]
 enum Bound {
@@ -611,36 +707,25 @@ enum Bound {
     Not(Box<Bound>),
     Cmp { attr: Attr, op: Op, value: Value },
     InRange { attr: Attr, lo: Value, hi: Value },
+    Lexical { field: LexicalField, terms: String },
     TextSet(HashSet<u64>),
 }
 
 fn collect_text_sets(
     e: &Expr,
-    lex: Option<&LexicalReader>,
     vector: Option<&rsd_vector::VectorPlane>,
     limit: usize,
-    path_scopes: Option<&[PathBuf]>,
     allowed_oids: &HashSet<u64>,
     out: &mut Vec<HashSet<u64>>,
 ) -> Result<()> {
     match e {
         Expr::And(v) | Expr::Or(v) => {
             for x in v {
-                collect_text_sets(x, lex, vector, limit, path_scopes, allowed_oids, out)?;
+                collect_text_sets(x, vector, limit, allowed_oids, out)?;
             }
         }
-        Expr::Not(b) => collect_text_sets(b, lex, vector, limit, path_scopes, allowed_oids, out)?,
-        Expr::Text { terms } => {
-            let lex = lex.ok_or(QueryError::NoLexicalPlane)?;
-            let oids = match path_scopes {
-                Some(scopes) => {
-                    let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
-                    lex.search_content_scoped(terms, false, &refs, limit.max(65_536))?
-                }
-                None => lex.search_content(terms, false, limit.max(65_536))?,
-            };
-            out.push(oids.into_iter().collect());
-        }
+        Expr::Not(b) => collect_text_sets(b, vector, limit, allowed_oids, out)?,
+        Expr::Text { .. } => {}
         Expr::Semantic { query } => {
             let vp = vector.ok_or(QueryError::NoVectorPlane)?;
             out.push(
@@ -653,34 +738,12 @@ fn collect_text_sets(
         }
         Expr::Cmp {
             attr: Attr::TextContent,
-            value: Value::Str { text, .. },
             ..
-        } => {
-            let lex = lex.ok_or(QueryError::NoLexicalPlane)?;
-            let oids = match path_scopes {
-                Some(scopes) => {
-                    let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
-                    lex.search_content_scoped(text, false, &refs, limit.max(65_536))?
-                }
-                None => lex.search_content(text, false, limit.max(65_536))?,
-            };
-            out.push(oids.into_iter().collect());
-        }
+        } => {}
         Expr::Cmp {
             attr: Attr::Symbols,
-            value: Value::Str { text, .. },
             ..
-        } => {
-            let lex = lex.ok_or(QueryError::NoLexicalPlane)?;
-            let oids = match path_scopes {
-                Some(scopes) => {
-                    let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
-                    lex.search_symbols_scoped(text, &refs, limit.max(65_536))?
-                }
-                None => lex.search_symbols(text, limit.max(65_536))?,
-            };
-            out.push(oids.into_iter().collect());
-        }
+        } => {}
         _ => {}
     }
     Ok(())
@@ -691,13 +754,27 @@ fn bind_text_sets(e: &Expr, sets: &mut impl Iterator<Item = HashSet<u64>>) -> Bo
         Expr::And(v) => Bound::And(v.iter().map(|x| bind_text_sets(x, sets)).collect()),
         Expr::Or(v) => Bound::Or(v.iter().map(|x| bind_text_sets(x, sets)).collect()),
         Expr::Not(b) => Bound::Not(Box::new(bind_text_sets(b, sets))),
-        Expr::Text { .. } | Expr::Semantic { .. } => {
-            Bound::TextSet(sets.next().unwrap_or_default())
-        }
+        Expr::Text { terms } => Bound::Lexical {
+            field: LexicalField::Content,
+            terms: terms.clone(),
+        },
+        Expr::Semantic { .. } => Bound::TextSet(sets.next().unwrap_or_default()),
         Expr::Cmp {
-            attr: Attr::TextContent | Attr::Symbols,
+            attr: Attr::TextContent,
+            value: Value::Str { text, .. },
             ..
-        } => Bound::TextSet(sets.next().unwrap_or_default()),
+        } => Bound::Lexical {
+            field: LexicalField::Content,
+            terms: text.clone(),
+        },
+        Expr::Cmp {
+            attr: Attr::Symbols,
+            value: Value::Str { text, .. },
+            ..
+        } => Bound::Lexical {
+            field: LexicalField::Symbols,
+            terms: text.clone(),
+        },
         Expr::Cmp { attr, op, value } => Bound::Cmp {
             attr: *attr,
             op: *op,
@@ -730,11 +807,42 @@ fn cmp_f(op: Op, a: f64, b: f64) -> bool {
     }
 }
 
-fn eval(e: &Bound, oid: u64, path: &str, rec: &ObjectRecord) -> bool {
-    match e {
-        Bound::And(v) => v.iter().all(|x| eval(x, oid, path, rec)),
-        Bound::Or(v) => v.iter().any(|x| eval(x, oid, path, rec)),
-        Bound::Not(b) => !eval(b, oid, path, rec),
+fn eval(
+    e: &Bound,
+    oid: u64,
+    path: &str,
+    rec: &ObjectRecord,
+    lexical: Option<&LexicalReader>,
+) -> Result<bool> {
+    Ok(match e {
+        Bound::And(v) => {
+            let mut matched = true;
+            for child in v {
+                if !eval(child, oid, path, rec, lexical)? {
+                    matched = false;
+                    break;
+                }
+            }
+            matched
+        }
+        Bound::Or(v) => {
+            let mut matched = false;
+            for child in v {
+                if eval(child, oid, path, rec, lexical)? {
+                    matched = true;
+                    break;
+                }
+            }
+            matched
+        }
+        Bound::Not(b) => !eval(b, oid, path, rec, lexical)?,
+        Bound::Lexical { field, terms } => {
+            let lexical = lexical.ok_or(QueryError::NoLexicalPlane)?;
+            match field {
+                LexicalField::Content => lexical.matches_content(oid, terms, false)?,
+                LexicalField::Symbols => lexical.matches_symbols(oid, terms)?,
+            }
+        }
         Bound::TextSet(set) => set.contains(&oid),
         Bound::InRange { attr, lo, hi } => match num_attr(*attr, rec) {
             Some(v) => value_num(lo) <= v && v <= value_num(hi),
@@ -763,7 +871,7 @@ fn eval(e: &Bound, oid: u64, path: &str, rec: &ObjectRecord) -> bool {
             (Attr::ModificationDate, v) => cmp_f(*op, rec.mtime_ns as f64, value_num(v)),
             _ => false,
         },
-    }
+    })
 }
 
 fn value_num(v: &Value) -> f64 {

@@ -9,7 +9,7 @@
 use rsd_caes::{CaesKey, Store, ABI_VERSION};
 use rsd_catalog::{Catalog, Change};
 use std::path::Path;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TantivyDocument, Value, FAST, INDEXED, STORED, STRING, TEXT,
@@ -324,6 +324,28 @@ impl LexicalReader {
         self.search_field_scoped(self.f_content, terms, phrase, scopes, limit)
     }
 
+    /// Exact number of content documents matching the query. Unlike ranked
+    /// search, this has no top-k result cap.
+    pub fn count_content(&self, terms: &str, phrase: bool) -> Result<u64> {
+        self.count_field(self.f_content, terms, phrase)
+    }
+
+    pub fn count_content_scoped(
+        &self,
+        terms: &str,
+        phrase: bool,
+        scopes: &[&Path],
+    ) -> Result<u64> {
+        self.count_field_scoped(self.f_content, terms, phrase, scopes)
+    }
+
+    /// Exact single-document membership used by mixed-predicate catalog
+    /// scans. Keeping this as an index query avoids materializing a capped set
+    /// of matching object ids.
+    pub fn matches_content(&self, oid: u64, terms: &str, phrase: bool) -> Result<bool> {
+        self.matches_field(self.f_content, oid, terms, phrase)
+    }
+
     /// Symbol search → matching oids.
     pub fn search_symbols(&self, terms: &str, limit: usize) -> Result<Vec<u64>> {
         self.search_field(self.f_symbols, terms, false, limit)
@@ -336,6 +358,10 @@ impl LexicalReader {
         limit: usize,
     ) -> Result<Vec<u64>> {
         self.search_field_scoped(self.f_symbols, terms, false, scopes, limit)
+    }
+
+    pub fn matches_symbols(&self, oid: u64, terms: &str) -> Result<bool> {
+        self.matches_field(self.f_symbols, oid, terms, false)
     }
 
     fn search_field_scoped(
@@ -391,6 +417,74 @@ impl LexicalReader {
         self.search_query(query.as_ref(), limit)
     }
 
+    fn count_field(&self, field: Field, terms: &str, phrase: bool) -> Result<u64> {
+        let Some(query) = self.field_query(field, terms, phrase) else {
+            return Ok(0);
+        };
+        self.count_query(query.as_ref())
+    }
+
+    fn count_field_scoped(
+        &self,
+        field: Field,
+        terms: &str,
+        phrase: bool,
+        scopes: &[&Path],
+    ) -> Result<u64> {
+        if scopes.is_empty() {
+            return Ok(0);
+        }
+        let Some(content) = self.field_query(field, terms, phrase) else {
+            return Ok(0);
+        };
+        let mut unique = std::collections::HashSet::new();
+        let scope_queries: Vec<(Occur, Box<dyn Query>)> = scopes
+            .iter()
+            .filter_map(|scope| {
+                let text = scope.to_string_lossy().into_owned();
+                unique.insert(text.clone()).then(|| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(self.f_path_scope, &text),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    )
+                })
+            })
+            .collect();
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, content),
+            (
+                Occur::Must,
+                Box::new(BooleanQuery::new(scope_queries)) as Box<dyn Query>,
+            ),
+        ]);
+        self.count_query(&query)
+    }
+
+    fn matches_field(&self, field: Field, oid: u64, terms: &str, phrase: bool) -> Result<bool> {
+        let Some(content) = self.field_query(field, terms, phrase) else {
+            return Ok(false);
+        };
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, content),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_u64(self.f_oid, oid),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            ),
+        ]);
+        Ok(self.count_query(&query)? != 0)
+    }
+
+    fn count_query(&self, query: &dyn Query) -> Result<u64> {
+        let searcher = self.reader.searcher();
+        Ok(searcher.search(query, &Count)? as u64)
+    }
+
     fn search_query(&self, query: &dyn Query, limit: usize) -> Result<Vec<u64>> {
         let searcher = self.reader.searcher();
         let top = searcher.search(query, &TopDocs::with_limit(limit.max(1)))?;
@@ -424,4 +518,37 @@ pub fn rebuild(
     let mut plane = LexicalPlane::open(dir)?;
     plane.rebuild_current(journal.max_lsn(), catalog, caes)?;
     Ok(plane)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_count_is_not_truncated_by_ranked_search_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = LexicalReader::open(tmp.path()).unwrap();
+        let mut writer = reader.index.writer(64 * 1024 * 1024).unwrap();
+        for oid in 1..=10_025u64 {
+            let mut doc = TantivyDocument::default();
+            doc.add_u64(reader.f_oid, oid);
+            doc.add_text(reader.f_content, "shared marker");
+            doc.add_text(reader.f_path_scope, "/authorized");
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+        reader.reader.reload().unwrap();
+
+        assert_eq!(
+            reader.search_content("shared", false, 10_000).unwrap().len(),
+            10_000
+        );
+        assert_eq!(reader.count_content("shared", false).unwrap(), 10_025);
+        assert_eq!(
+            reader
+                .count_content_scoped("shared", false, &[Path::new("/authorized")])
+                .unwrap(),
+            10_025
+        );
+    }
 }

@@ -129,15 +129,14 @@ fn serve_conn(mut stream: UnixStream, ctx: &IpcCtx) -> std::io::Result<()> {
                 scope,
                 count_only,
             } => {
-                let resp = run_query(ctx, lexical.as_ref(), &authz_scope, &rql, scope.as_deref())
-                    .map(|hits| {
-                        if count_only {
-                            Response::Count(hits.len() as u64)
-                        } else {
-                            Response::Hits(hits)
-                        }
-                    })
-                    .unwrap_or_else(Response::Err);
+                let resp = if count_only {
+                    run_count(ctx, lexical.as_ref(), &authz_scope, &rql, scope.as_deref())
+                        .map(Response::Count)
+                } else {
+                    run_query(ctx, lexical.as_ref(), &authz_scope, &rql, scope.as_deref())
+                        .map(Response::Hits)
+                }
+                .unwrap_or_else(Response::Err);
                 send(&mut stream, &resp).map_err(std::io::Error::other)?;
             }
             Request::SubscribeAlert { query, threshold } => {
@@ -263,4 +262,35 @@ fn run_query(
             path: h.path,
         })
         .collect())
+}
+
+fn run_count(
+    ctx: &IpcCtx,
+    lexical: Option<&LexicalReader>,
+    authz_scope: &Scope,
+    rql: &str,
+    scope: Option<&str>,
+) -> Result<u64, String> {
+    let expr = parse(rql).map_err(|e| e.to_string())?;
+    let vguard = ctx
+        .vector
+        .as_ref()
+        .map(|vector| vector.lock().unwrap_or_else(|error| error.into_inner()));
+    let engine = QueryEngine {
+        catalog: &ctx.catalog,
+        lexical,
+        vector: vguard.as_deref(),
+        limit: 10_000,
+    };
+    match authz_scope {
+        Scope::Unrestricted => engine.count(&expr, scope),
+        Scope::Paths(prefixes) => {
+            let grants: Vec<PathBuf> = prefixes
+                .iter()
+                .map(|prefix| prefix.as_path().to_path_buf())
+                .collect();
+            engine.count_authorized(&expr, scope, &grants)
+        }
+    }
+    .map_err(|e| e.to_string())
 }

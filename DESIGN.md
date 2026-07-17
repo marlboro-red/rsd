@@ -670,8 +670,10 @@ visibility; it grants it explicitly.
   daemon configures no UDS grants; verified first-party identity, persistent grant
   management, and dynamic revocation remain T0 targets. Lexical documents carry
   non-stored component-ancestor scope terms, catalog enumeration is scope-first,
-  and the exact-scan semantic plane filters oids before ranking. Exact counts above
-  the current query cap and statistical timing tests remain unfinished. The
+  and the exact-scan semantic plane filters oids before ranking. Lexical and catalog
+  RQL counts use uncapped counting paths over the authorized candidate set; ranked
+  semantic predicates reject exact-count requests because membership has no
+  threshold. Aggregates and statistical timing tests remain unfinished. The
   token-authenticated loopback UI surface is separate.
 - **Enforcement-point target**: scope filters constrain **candidate generation**, not final
   results — counts, aggregates, group-bys, rank positions, snippets, and live-view

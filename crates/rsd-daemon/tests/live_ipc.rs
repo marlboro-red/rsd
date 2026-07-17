@@ -2,7 +2,7 @@
 //! from-scratch property, and notify latency.
 
 use rsd_caes::Store;
-use rsd_catalog::{Catalog, Durability};
+use rsd_catalog::{Catalog, Change, Durability, FileId, ObjectKind, StatInfo};
 use rsd_daemon::ipc::{start_ipc, AuthzStore, IpcCtx};
 use rsd_daemon::{bring_up, ContentIndexer, ContentSource, PipelineConfig};
 use rsd_extract::{extract_bytes, Budgets, ExtractHints};
@@ -119,6 +119,66 @@ fn connect(env: &Env, principal: &str) -> UnixStream {
         panic!("no hello");
     };
     s
+}
+
+#[test]
+fn ipc_count_is_exact_above_the_hit_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(
+        Catalog::open_with_durability(&tmp.path().join("cat.redb"), Durability::None).unwrap(),
+    );
+    let changes: Vec<Change> = (1..=10_025u64)
+        .map(|ino| Change::Upsert {
+            path: format!("/virtual/{ino}.txt"),
+            stat: StatInfo {
+                kind: ObjectKind::File,
+                file_id: FileId { dev: 1, ino },
+                size: 1,
+                mtime_ns: 1,
+                birthtime_ns: ino as i64,
+                nlink: 1,
+            },
+        })
+        .collect();
+    catalog.apply_changes_direct(&changes).unwrap();
+
+    let mut authz = AuthzStore::default();
+    authz.grant_unrestricted("counter");
+    let socket = tmp.path().join("count.sock");
+    start_ipc(
+        &socket,
+        IpcCtx {
+            catalog,
+            lexical_dir: tmp.path().join("lexical"),
+            vector: None,
+            live: Arc::new(Mutex::new(LiveEngine::new(None))),
+            authz: Arc::new(authz),
+        },
+    )
+    .unwrap();
+
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    send(
+        &mut stream,
+        &Request::Hello {
+            principal: "counter".into(),
+        },
+    )
+    .unwrap();
+    let _: Response = recv(&mut stream).unwrap();
+    send(
+        &mut stream,
+        &Request::Query {
+            rql: "kMDItemFSSize > 0".into(),
+            scope: None,
+            count_only: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        recv(&mut stream).unwrap(),
+        Response::Count(10_025)
+    ));
 }
 
 fn expect_event(s: &mut UnixStream, deadline: Duration) -> Response {
