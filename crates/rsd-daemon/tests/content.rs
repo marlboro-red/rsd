@@ -191,22 +191,24 @@ fn byte_identical_copy_is_a_caes_hit_not_an_extraction() {
     let hits0 = env.counters.caes_hits.load(Ordering::Relaxed);
 
     std::fs::copy(env.root.join("f3.txt"), env.root.join("copy-of-f3.txt")).unwrap();
+    let copy = env.root.join("copy-of-f3.txt").to_string_lossy().into_owned();
     wait_until(
-        || env.counters.caes_hits.load(Ordering::Relaxed) > hits0,
+        || {
+            env.cat
+                .get_by_path(&copy)
+                .ok()
+                .flatten()
+                .is_some_and(|(_, rec)| rec.index_state.as_deref() == Some("complete"))
+        },
         Duration::from_secs(10),
-        "CAES hit for the copy",
+        "committed content state for the CAES-hit copy",
     );
+    assert!(env.counters.caes_hits.load(Ordering::Relaxed) > hits0);
     assert_eq!(
         env.calls.load(Ordering::Relaxed),
         20,
         "copy must be a pure store hit"
     );
-    let (_, rec) = env
-        .cat
-        .get_by_path(&env.root.join("copy-of-f3.txt").to_string_lossy())
-        .unwrap()
-        .expect("copy cataloged");
-    assert_eq!(rec.index_state.as_deref(), Some("complete"));
     env.pipeline.stop();
 }
 
