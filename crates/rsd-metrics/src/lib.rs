@@ -196,6 +196,8 @@ pub struct Metrics {
     pub bootstrap_dirs: Gauge,
     /// 0 = bootstrapping, 1 = complete.
     pub bootstrap_done: Gauge,
+    /// 1 once the single-writer applier has panicked.
+    pub applier_down: Gauge,
 }
 
 impl Metrics {
@@ -224,6 +226,7 @@ impl Metrics {
             catalog_entries: Gauge::new(),
             bootstrap_dirs: Gauge::new(),
             bootstrap_done: Gauge::new(),
+            applier_down: Gauge::new(),
         }
     }
 
@@ -281,6 +284,7 @@ pub fn snapshot_json() -> serde_json::Value {
             "catalog_entries": m.catalog_entries.get(),
             "bootstrap_dirs": m.bootstrap_dirs.get(),
             "bootstrap_done": m.bootstrap_done.get() == 1,
+            "applier_down": m.applier_down.get() == 1,
         },
     })
 }
@@ -336,5 +340,6 @@ mod tests {
                 .unwrap()
                 >= 1
         );
+        assert_eq!(s["backlog"]["applier_down"], false);
     }
 }

@@ -201,6 +201,7 @@ fn serve(
                 "entries": entries,
                 "objects": objects,
                 "semantic": ctx.vector.is_some(),
+                "applier_down": rsd_metrics::metrics().applier_down.get() == 1,
             });
             respond(&mut stream, "200 OK", &body.to_string())
         }

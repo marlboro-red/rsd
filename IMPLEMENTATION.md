@@ -81,6 +81,9 @@ extraction, no query engine yet — correctness of observation only.
     rescan path.
   - Hard-link and rename storms converge (identity preserved via `by_fileid`).
 - `rsd-daemon watch <root>` smoke binary: bootstrap + live convergence + stats line.
+- Applier mutexes recover poison, and the applier thread has a panic boundary that
+  raises a sticky `applier_down` flag exposed by the HUD, metrics snapshot, and
+  HTTP status instead of silently serving stale state.
 
 ## Phase 2 — Journal, CAES, commit state machine (design §6.1–6.2, §7.3–7.4, spike 2)
 

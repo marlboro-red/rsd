@@ -113,6 +113,7 @@ impl Pipeline {
         let stats = Arc::new(Mutex::new(ScanStats::default()));
         let stopping = Arc::new(AtomicBool::new(false));
         let applier_down = Arc::new(AtomicBool::new(false));
+        rsd_metrics::metrics().applier_down.set(0);
 
         let (ingest_tx, ingest_rx) = mpsc::channel::<IngestEvent>();
         let (work_tx, work_rx) = mpsc::sync_channel::<WorkItem>(cfg.work_capacity);
@@ -193,6 +194,7 @@ impl Pipeline {
                     }));
                     if result.is_err() {
                         applier_down_thread.store(true, Ordering::Release);
+                        rsd_metrics::metrics().applier_down.set(1);
                         tracing::error!("health.applier_down=1: applier thread panicked");
                     }
                 })?

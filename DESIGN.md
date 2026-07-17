@@ -884,7 +884,9 @@ that already exist.
   effectiveness), `commits`, `extract_ms`, `commit_ms`, `index_latency_ms`,
   `full_rescans` (the convergence canary), `quarantines`,
   `extraction_failures{status}`, `journal_replays`, `catalog_entries`,
-  `bootstrap_dirs/done`.
+  `bootstrap_dirs/done`, and the sticky `applier_down` health gauge. An applier
+  panic is caught at the thread boundary and becomes visible in stderr, metrics,
+  and `/api/status` instead of leaving an apparently healthy stale daemon.
 - **`/api/metrics`** JSON snapshot + the **RSD.app Activity HUD** (1Hz, pure
   reader): files indexed, live latency p50/p99, commit latency, dedup rate,
   bootstrap progress, and a green/orange convergence light off `full_rescans`.
