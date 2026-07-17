@@ -18,7 +18,9 @@ open dist/RSD.app                             # then ⌥Space from anywhere
 
 CLI: `rsdfind --state <state-dir> [--semantic|--hybrid] "query"`, plus
 `-live` standing queries and `-live --semantic` alerts.
-Agents: `rsd-mcp --state <state-dir>` (MCP over stdio: search + grounded snippets).
+Agents: `rsd-mcp --state <state-dir> --scope <allowed-root>` (repeat `--scope`
+for more roots). Trusted first-party use must opt in explicitly with
+`--unrestricted`. MCP runs over stdio with search + grounded snippets.
 
 ## Why it's different
 

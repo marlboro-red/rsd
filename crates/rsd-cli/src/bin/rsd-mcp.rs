@@ -20,6 +20,54 @@ struct State {
     lexical: Option<LexicalReader>,
     vector: Option<VectorPlane>,
     caes: Option<rsd_caes::Store>,
+    /// None is explicit unrestricted authority; Some is the granted roots.
+    grants: Option<Vec<std::path::PathBuf>>,
+}
+
+const MAX_TOOL_RESULTS: usize = 1_000;
+
+#[derive(Debug, PartialEq, Eq)]
+struct Config {
+    state_dir: std::path::PathBuf,
+    grants: Option<Vec<std::path::PathBuf>>,
+}
+
+fn parse_args(args: &[String]) -> Result<Config, String> {
+    let mut state_dir = None;
+    let mut scopes = Vec::new();
+    let mut unrestricted = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state" => {
+                i += 1;
+                state_dir = args.get(i).map(std::path::PathBuf::from);
+                if state_dir.is_none() {
+                    return Err("--state requires a directory".into());
+                }
+            }
+            "--scope" => {
+                i += 1;
+                let Some(scope) = args.get(i) else {
+                    return Err("--scope requires a path".into());
+                };
+                scopes.push(std::path::PathBuf::from(scope));
+            }
+            "--unrestricted" => unrestricted = true,
+            other => return Err(format!("unknown argument {other}")),
+        }
+        i += 1;
+    }
+    let state_dir = state_dir.ok_or("--state is required")?;
+    let grants = match (unrestricted, scopes.is_empty()) {
+        (true, true) => None,
+        (false, false) => Some(scopes),
+        (true, false) => return Err("--scope and --unrestricted are mutually exclusive".into()),
+        (false, true) => {
+            return Err("explicit authority required: pass --scope PATH or --unrestricted".into())
+        }
+    };
+    Ok(Config { state_dir, grants })
 }
 
 fn rsd_ml_or_hash() -> std::sync::Arc<dyn rsd_vector::Embedder> {
@@ -31,22 +79,24 @@ fn rsd_ml_or_hash() -> std::sync::Arc<dyn rsd_vector::Embedder> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let state_dir = match args.as_slice() {
-        [flag, dir] if flag == "--state" => std::path::PathBuf::from(dir),
-        _ => {
-            eprintln!("usage: rsd-mcp --state <dir>");
+    let config = match parse_args(&args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("rsd-mcp: {error}");
+            eprintln!("usage: rsd-mcp --state <dir> (--scope <path>... | --unrestricted)");
             std::process::exit(2);
         }
     };
     let st = State {
         catalog: Catalog::open_with_durability(
-            &state_dir.join("catalog.redb"),
+            &config.state_dir.join("catalog.redb"),
             Durability::Eventual,
         )
         .expect("catalog"),
-        lexical: LexicalReader::open(&state_dir.join("lexical")).ok(),
-        vector: VectorPlane::open(&state_dir.join("vector.redb"), rsd_ml_or_hash()).ok(),
-        caes: rsd_caes::Store::open(&state_dir.join("caes.redb")).ok(),
+        lexical: LexicalReader::open(&config.state_dir.join("lexical")).ok(),
+        vector: VectorPlane::open(&config.state_dir.join("vector.redb"), rsd_ml_or_hash()).ok(),
+        caes: rsd_caes::Store::open(&config.state_dir.join("caes.redb")).ok(),
+        grants: config.grants,
     };
 
     let stdin = std::io::stdin();
@@ -92,7 +142,11 @@ fn main() {
                     .and_then(|q| q.as_str())
                     .unwrap_or("")
                     .to_string();
-                let limit = a.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
+                let limit = a
+                    .get("limit")
+                    .and_then(|l| l.as_u64())
+                    .unwrap_or(10)
+                    .clamp(1, MAX_TOOL_RESULTS as u64) as usize;
                 let kind = a.get("kind").and_then(|k| k.as_str()).unwrap_or("hybrid");
                 let out = match name {
                     "rsd_search" => run_search(&st, &query, kind, limit),
@@ -117,29 +171,54 @@ fn main() {
     }
 }
 
-fn engine<'a>(st: &'a State) -> QueryEngine<'a> {
+fn engine<'a>(st: &'a State, limit: usize) -> QueryEngine<'a> {
     QueryEngine {
         catalog: &st.catalog,
         lexical: st.lexical.as_ref(),
         vector: st.vector.as_ref(),
-        limit: 1000,
+        limit: limit.clamp(1, MAX_TOOL_RESULTS),
+    }
+}
+
+fn run_expr(
+    st: &State,
+    expr: &rsd_query::Expr,
+    limit: usize,
+) -> rsd_query::Result<Vec<rsd_query::Hit>> {
+    let engine = engine(st, limit);
+    match &st.grants {
+        None => engine.run(expr, None),
+        Some(grants) => engine.run_authorized(expr, None, grants),
+    }
+}
+
+fn run_hybrid(st: &State, query: &str, limit: usize) -> rsd_query::Result<Vec<rsd_query::Hit>> {
+    let engine = engine(st, limit);
+    match &st.grants {
+        None => engine.hybrid(query, limit),
+        Some(grants) => Ok(engine
+            .hybrid_tagged_authorized(query, limit, grants)?
+            .into_iter()
+            .map(|(hit, _)| hit)
+            .collect()),
     }
 }
 
 fn run_search(st: &State, query: &str, kind: &str, limit: usize) -> Result<String, String> {
+    let limit = limit.clamp(1, MAX_TOOL_RESULTS);
     let hits = match kind {
-        "hybrid" => engine(st).hybrid(query, limit).map_err(|e| e.to_string())?,
+        "hybrid" => run_hybrid(st, query, limit).map_err(|e| e.to_string())?,
         "semantic" => {
             let expr = parse(&format!(r#"semantic("{query}")"#)).map_err(|e| e.to_string())?;
-            engine(st).run(&expr, None).map_err(|e| e.to_string())?
+            run_expr(st, &expr, limit).map_err(|e| e.to_string())?
         }
         "rql" => {
             let expr = parse(query).map_err(|e| e.to_string())?;
-            engine(st).run(&expr, None).map_err(|e| e.to_string())?
+            run_expr(st, &expr, limit).map_err(|e| e.to_string())?
         }
         _ => {
             let expr = parse(&format!(r#""{query}""#)).map_err(|e| e.to_string())?;
-            engine(st).run(&expr, None).map_err(|e| e.to_string())?
+            run_expr(st, &expr, limit).map_err(|e| e.to_string())?
         }
     };
     let lines: Vec<String> = hits.iter().take(limit).map(|h| h.path.clone()).collect();
@@ -151,7 +230,8 @@ fn run_search(st: &State, query: &str, kind: &str, limit: usize) -> Result<Strin
 }
 
 fn run_snippets(st: &State, query: &str, limit: usize) -> Result<String, String> {
-    let hits = engine(st).hybrid(query, limit).map_err(|e| e.to_string())?;
+    let limit = limit.clamp(1, MAX_TOOL_RESULTS);
+    let hits = run_hybrid(st, query, limit).map_err(|e| e.to_string())?;
     let caes = st.caes.as_ref().ok_or("no CAES store")?;
     let mut out = String::new();
     for h in hits.iter().take(limit) {
@@ -204,4 +284,47 @@ fn run_snippets(st: &State, query: &str, limit: usize) -> Result<String, String>
     } else {
         out
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn authority_is_explicit_and_modes_are_mutually_exclusive() {
+        assert!(parse_args(&args(&["--state", "/tmp/state"])).is_err());
+        assert!(parse_args(&args(&[
+            "--state",
+            "/tmp/state",
+            "--scope",
+            "/allowed",
+            "--unrestricted",
+        ]))
+        .is_err());
+        assert_eq!(
+            parse_args(&args(&[
+                "--state",
+                "/tmp/state",
+                "--scope",
+                "/allowed/a",
+                "--scope",
+                "/allowed/b",
+            ]))
+            .unwrap()
+            .grants
+            .unwrap()
+            .len(),
+            2
+        );
+        assert_eq!(
+            parse_args(&args(&["--state", "/tmp/state", "--unrestricted"]))
+                .unwrap()
+                .grants,
+            None
+        );
+    }
 }

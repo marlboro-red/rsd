@@ -700,11 +700,11 @@ while the session is locked is a T2 item with real key management, not a checkbo
 
 - **IPC**: XPC (identity-bearing) + UDS (first-party dev path), length-prefixed
   postcard frames, stream-multiplexed subscriptions.
-- **MCP server (`rsd-mcp`)**: tools — `search` (RQL or NL), `snippets` (grounded
-  chunks + byte ranges), `subscribe` (standing views per §9 classes), `provenance`
-  (edges with evidence chains), `history` (AS OF / DIFF with availability labels).
-  Scope-gated per §11. Local agents get a private, cited, real-time view of exactly
-  the corpus the user granted.
+- **MCP server (`rsd-mcp`) — shipping subset**: `search` (lexical, semantic,
+  hybrid, or RQL) and `snippets` (grounded chunks + byte ranges). Startup fails
+  without explicit repeated `--scope` roots or `--unrestricted`; every retrieval
+  mode shares that authority and tool limits are capped. `subscribe`, `provenance`,
+  and `history` remain surface targets.
 - **CLI**: `rsdfind` (mdfind-flag-compatible + RQL + `--ask`), `rsdctl` (scopes,
   grants, plugins, retention, `doctor`, `top`, `ranking explain`,
   `rebuild --plane`).

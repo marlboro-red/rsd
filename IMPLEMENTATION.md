@@ -267,8 +267,10 @@ archive set; battery gate verified via powermetrics protocol.
 **P7.2 — WASM extractor ABI** (WIT interface, fuel/memory/output budgets, EPUB
 reference plugin). Success: within 2× native throughput on text-heavy formats;
 hostile-plugin suite (infinite loop, alloc bomb, output flood) all contained.
-**P7.3 — MCP server [x]** (rsd_search lexical/semantic/hybrid/rql + rsd_snippets with byte offsets, stdio JSON-RPC) (search/snippets/subscribe/provenance/history, scope-gated).
-Success: leak suite passes against MCP principal; agent round-trip demo with
+**P7.3 — MCP server [x]** (rsd_search lexical/semantic/hybrid/rql + rsd_snippets with byte offsets, stdio JSON-RPC). Startup requires explicit repeated `--scope`
+roots or an explicit `--unrestricted`; lexical, semantic, hybrid, RQL, and snippets
+share that authority, and tool result limits are clamped to 1,000.
+Success: scope/limit leak regression passes against the MCP process; agent round-trip demo with
 byte-range citations.
 **P7.4 — mdimporter compat** (per-bundle processes, crash quotas). Success: top-10
 common third-party importers run or are cleanly blacklisted; daemon uptime
