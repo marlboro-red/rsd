@@ -2129,6 +2129,7 @@ dependencies = [
  "rsd-query",
  "rsd-vector",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

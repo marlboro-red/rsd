@@ -227,6 +227,16 @@ fn main() {
     if explain {
         eprintln!("plan: {:?}", engine.plan(&expr));
     }
+    if count {
+        match engine.count(&expr, onlyin.as_deref()) {
+            Ok(total) => println!("{total}"),
+            Err(e) => {
+                eprintln!("rsdfind: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let hits = match engine.run(&expr, onlyin.as_deref()) {
         Ok(h) => h,
         Err(e) => {
@@ -237,10 +247,6 @@ fn main() {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    if count {
-        let _ = writeln!(out, "{}", hits.len());
-        return;
-    }
     for h in hits {
         if nul {
             let _ = write!(out, "{}\0", h.path);

@@ -10,7 +10,7 @@ struct Metrics: Decodable {
     struct Health: Decodable { let full_rescans: Int; let worker_crashes: Int; let quarantines: Int; let journal_replays: Int }
     struct Hist: Decodable { let count: Int; let mean_ms: Double; let p50_ms: Double; let p90_ms: Double; let p99_ms: Double }
     struct Freshness: Decodable { let index_latency_ms: Hist; let extract_ms: Hist; let commit_ms: Hist }
-    struct Backlog: Decodable { let coalescer_depth: Int; let catalog_entries: Int; let bootstrap_dirs: Int; let bootstrap_done: Bool }
+    struct Backlog: Decodable { let coalescer_depth: Int; let catalog_entries: Int; let bootstrap_dirs: Int; let bootstrap_done: Bool; let applier_down: Bool }
     let throughput: Throughput
     let health: Health
     let freshness: Freshness
@@ -27,7 +27,7 @@ final class ActivityModel: ObservableObject {
         timer?.cancel()
         timer = Task {
             while !Task.isCancelled {
-                if let (data, _) = try? await URLSession.shared.data(from: API.url("/api/metrics")),
+                if let (data, _) = try? await URLSession.shared.data(for: API.request("/api/metrics")),
                    let parsed = try? JSONDecoder().decode(Metrics.self, from: data) {
                     self.m = parsed
                     self.reachable = true
@@ -78,6 +78,7 @@ struct ActivityView: View {
     private var convergenceLight: some View {
         let ok = (model.m?.health.full_rescans ?? 0) == 0
             && (model.m?.health.worker_crashes ?? 0) == 0
+            && !(model.m?.backlog.applier_down ?? false)
         return HStack(spacing: 6) {
             Circle().fill(ok ? Color.green : Color.orange).frame(width: 8, height: 8)
             Text(ok ? "converged" : "degraded")
@@ -109,6 +110,9 @@ struct ActivityView: View {
             }
             if m.health.full_rescans > 0 {
                 row("Full rescans", "\(m.health.full_rescans)", warn: true)
+            }
+            if m.backlog.applier_down {
+                row("Applier", "down", warn: true)
             }
         }
     }

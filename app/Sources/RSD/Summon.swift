@@ -49,7 +49,7 @@ final class Summoner: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     /// ⌥Space — Spotlight keeps ⌘Space; we take the key next door.
     private func registerHotKey() {
-        var hotKeyID = EventHotKeyID(signature: OSType(0x5253_4421), id: 1) // 'RSD!'
+        let hotKeyID = EventHotKeyID(signature: OSType(0x5253_4421), id: 1) // 'RSD!'
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)

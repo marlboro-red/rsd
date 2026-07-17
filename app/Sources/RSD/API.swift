@@ -15,10 +15,17 @@ enum API {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    /// Build a token-authenticated URL for `path` with extra query items.
+    /// Build a URL for `path` with extra query items. Authentication stays in
+    /// a header so the bearer secret never enters URL logs or diagnostics.
     static func url(_ path: String, _ items: [URLQueryItem] = []) -> URL {
         var comps = URLComponents(string: base + path)!
-        comps.queryItems = items + [.init(name: "token", value: token)]
+        comps.queryItems = items
         return comps.url!
+    }
+
+    static func request(_ path: String, _ items: [URLQueryItem] = []) -> URLRequest {
+        var request = URLRequest(url: url(path, items))
+        request.setValue(token, forHTTPHeaderField: "X-RSD-Token")
+        return request
     }
 }

@@ -60,11 +60,11 @@ final class AlertStore: ObservableObject {
     }
 
     private static func stream(_ alert: SavedAlert) async {
-        let url = API.url("/api/alert", [
+        let request = API.request("/api/alert", [
             .init(name: "q", value: alert.query),
             .init(name: "threshold", value: String(alert.threshold)),
         ])
-        guard let (bytes, _) = try? await URLSession.shared.bytes(from: url) else { return }
+        guard let (bytes, _) = try? await URLSession.shared.bytes(for: request) else { return }
         do {
             for try await line in bytes.lines {
                 guard line.hasPrefix("data: "),
@@ -72,7 +72,7 @@ final class AlertStore: ObservableObject {
                       let ev = try? JSONDecoder().decode(SseEvent.self, from: data),
                       ev.event == "enter", let path = ev.path
                 else { continue }
-                await Notifier.shared.deliver(
+                Notifier.shared.deliver(
                     title: "Similar to “\(alert.query)”",
                     body: (path as NSString).lastPathComponent,
                     path: path

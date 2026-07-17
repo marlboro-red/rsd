@@ -25,7 +25,7 @@ final class DaemonManager {
     }
 
     private func responds() async -> Bool {
-        var req = URLRequest(url: API.url("/api/status"))
+        var req = API.request("/api/status")
         req.timeoutInterval = 1.5
         if let (_, resp) = try? await URLSession.shared.data(for: req),
            let http = resp as? HTTPURLResponse {
@@ -47,9 +47,7 @@ final class DaemonManager {
         p.executableURL = bin
         p.arguments = ["watch", NSHomeDirectory(), "--state", stateDir.path]
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = try? FileHandle(
-            forWritingTo: logFile()
-        ) ?? FileHandle.nullDevice
+        p.standardError = (try? FileHandle(forWritingTo: logFile())) ?? FileHandle.nullDevice
         try? p.run()
         process = p
     }
