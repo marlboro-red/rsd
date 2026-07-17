@@ -584,13 +584,7 @@ impl<'a> QueryEngine<'a> {
 
         let allowed_oids = self.authorized_oids(effective.as_deref())?;
         let mut sets: Vec<HashSet<u64>> = Vec::new();
-        collect_text_sets(
-            expr,
-            self.vector,
-            self.limit,
-            &allowed_oids,
-            &mut sets,
-        )?;
+        collect_text_sets(expr, self.vector, self.limit, &allowed_oids, &mut sets)?;
         let mut sets_iter = sets.into_iter();
         let expr = bind_text_sets(expr, &mut sets_iter);
 
@@ -614,11 +608,7 @@ impl<'a> QueryEngine<'a> {
 
     fn candidate_paths(&self, scopes: Option<&[PathBuf]>) -> Result<Vec<String>> {
         let Some(scopes) = scopes else {
-            return Ok(self
-                .catalog
-                .listing()?
-                .into_keys()
-                .collect());
+            return Ok(self.catalog.listing()?.into_keys().collect());
         };
         let mut paths = HashSet::new();
         for scope in scopes {

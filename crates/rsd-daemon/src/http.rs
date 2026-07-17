@@ -247,13 +247,12 @@ fn serve(
                 limit: limit.max(50),
             };
             let hits = match mode.as_str() {
-                "hybrid" if engine.vector.is_some() => {
-                    run_http_hybrid(&engine, &q, limit, scope).map(|v| {
+                "hybrid" if engine.vector.is_some() => run_http_hybrid(&engine, &q, limit, scope)
+                    .map(|v| {
                         v.into_iter()
                             .map(|(h, o)| (h, o.as_str()))
                             .collect::<Vec<_>>()
-                    })
-                }
+                    }),
                 "semantic" => parse(&format!(r#"semantic("{}")"#, q.replace('"', "")))
                     .and_then(|e| run_http_query(&engine, &e, scope))
                     .map(|v| v.into_iter().map(|h| (h, "meaning")).collect::<Vec<_>>()),
@@ -304,11 +303,11 @@ fn serve(
             let threshold: f32 = get("threshold")
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(0.35);
-            let sub =
-                ctx.live
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .subscribe_alert(&q, threshold, scope.clone(), 1024);
+            let sub = ctx
+                .live
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .subscribe_alert(&q, threshold, scope.clone(), 1024);
             match sub {
                 Some((_, rx)) => sse_forward(&mut stream, rx),
                 None => respond(

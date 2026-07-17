@@ -330,12 +330,7 @@ impl LexicalReader {
         self.count_field(self.f_content, terms, phrase)
     }
 
-    pub fn count_content_scoped(
-        &self,
-        terms: &str,
-        phrase: bool,
-        scopes: &[&Path],
-    ) -> Result<u64> {
+    pub fn count_content_scoped(&self, terms: &str, phrase: bool, scopes: &[&Path]) -> Result<u64> {
         self.count_field_scoped(self.f_content, terms, phrase, scopes)
     }
 
@@ -540,7 +535,10 @@ mod tests {
         reader.reader.reload().unwrap();
 
         assert_eq!(
-            reader.search_content("shared", false, 10_000).unwrap().len(),
+            reader
+                .search_content("shared", false, 10_000)
+                .unwrap()
+                .len(),
             10_000
         );
         assert_eq!(reader.count_content("shared", false).unwrap(), 10_025);

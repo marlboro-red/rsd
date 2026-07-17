@@ -191,7 +191,11 @@ fn byte_identical_copy_is_a_caes_hit_not_an_extraction() {
     let hits0 = env.counters.caes_hits.load(Ordering::Relaxed);
 
     std::fs::copy(env.root.join("f3.txt"), env.root.join("copy-of-f3.txt")).unwrap();
-    let copy = env.root.join("copy-of-f3.txt").to_string_lossy().into_owned();
+    let copy = env
+        .root
+        .join("copy-of-f3.txt")
+        .to_string_lossy()
+        .into_owned();
     wait_until(
         || {
             env.cat
