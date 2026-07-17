@@ -410,7 +410,7 @@ this matrix. Test: crash/corruption-injection CI (spikes 1–2) exercises every 
 | Failure | Detection | Blast radius | Repair path |
 |---|---|---|---|
 | Crash mid-commit (any instruction) | Watermark divergence at startup | Docs in flight | Catalog replays its journal suffix; a lagged lexical/vector plane rebuilds current object identities from catalog + CAES, avoiding path-reuse ambiguity and filesystem reads |
-| Journal segment corrupt | Record checksums on open/replay; active-segment checksum failures are hard errors, only EOF-truncated frames are tail-repaired | That LSN range's *ordering* | **Partial shipping status:** corruption is detected without truncating a valid suffix; manifest-driven scoped re-verification remains a target |
+| Journal segment corrupt | Record checksums on open/replay; only EOF-truncated frames are tail-repaired. Durable active/sealed scope manifests allow the corrupt bytes to be quarantined, preserve the LSN range with repair placeholders, then append current filesystem truth for affected paths | That manifest's paths; corrupt bytes retained for diagnosis | Automatic scoped repair ships for segments carrying a durable scope manifest; legacy active segments without one still fail closed |
 | Lexical/vector segment corrupt | Segment checksums / scrubber | That segment's docs | Drop segment; rebuild from CAES records (segment manifests record membership); no filesystem reads needed within retention |
 | Catalog page damaged, redb recovers to prior root | redb MVCC recovery | Since-prior-root delta | Replay journal delta |
 | Catalog page damaged beyond redb recovery | Scrubber / read failure | Catalog plane | Rebuild skeleton from lexical stored fields + journal + CAES; close residual gap via anti-entropy scan of affected scopes |
@@ -485,7 +485,8 @@ safely re-runnable: delete-before-add within a keyed apply, replays after uncert
 commits converge to the same state. This is what makes cursor re-delivery (§6.1) and
 crash replay (§6.8) safe. Randomized kill injection covers journal/catalog and
 content-plane convergence; byte corruption tests currently cover journal segment
-detection, while automatic scoped repair remains a target.
+detection and manifest-scoped automatic repair; legacy segments without a scope
+manifest still fail closed rather than guessing.
 
 ### 7.5 Freshness targets
 

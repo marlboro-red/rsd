@@ -89,6 +89,10 @@ extraction, no query engine yet — correctness of observation only.
   seal with membership manifest, replay iterator, corrupt-record detection.
 - Success: unit tests incl. torn-write simulation (truncate mid-record → clean
   detection, replay stops at last valid record); fuzz decode never panics.
+- Correctness pass: sync-on-append active segments persist a durable path-scope
+  manifest. Mid-segment corruption quarantines the original bytes, reconstructs
+  the LSN range with repair placeholders, and appends current filesystem truth for
+  only the affected paths; content is re-keyed through the normal pinned-fd path.
 
 **P2.2 — Source-cursor fencing [x]**
 - Cursor persisted only after derived records are journaled (CursorStore,

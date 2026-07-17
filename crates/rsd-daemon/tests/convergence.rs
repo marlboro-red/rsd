@@ -133,6 +133,67 @@ fn live_events_advance_the_durable_fsevents_cursor() {
     );
 }
 
+#[test]
+fn scoped_journal_corruption_repairs_current_paths() {
+    let env = setup(12, 63);
+    let mut cfg = fast_cfg();
+    cfg.journal_sync = true;
+    let (pipeline, _) = bring_up(
+        env.cat.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        None,
+        None,
+        None,
+        cfg,
+    )
+    .unwrap();
+    assert_converged(&env.cat, &env.root);
+    pipeline.stop();
+
+    let removed = env
+        .cat
+        .listing()
+        .unwrap()
+        .keys()
+        .find(|path| Path::new(path).is_file())
+        .cloned()
+        .unwrap();
+    std::fs::remove_file(&removed).unwrap();
+
+    let segment = std::fs::read_dir(&env.journal_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "rlog"))
+        .unwrap();
+    let mut bytes = std::fs::read(&segment).unwrap();
+    bytes[8 + 1 + 4 + 16 + 2] ^= 0x80;
+    std::fs::write(&segment, bytes).unwrap();
+
+    let mut cfg = fast_cfg();
+    cfg.journal_sync = true;
+    let (pipeline, _) = bring_up(
+        env.cat.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        None,
+        None,
+        None,
+        cfg,
+    )
+    .unwrap();
+    assert_converged(&env.cat, &env.root);
+    assert!(env.cat.get_by_path(&removed).unwrap().is_none());
+    assert!(std::fs::read_dir(&env.journal_dir)
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")));
+    pipeline.stop();
+}
+
 /// Poll until the catalog converges to the filesystem or the deadline passes.
 fn wait_converged(cat: &Catalog, root: &Path, deadline: Duration) {
     let start = Instant::now();

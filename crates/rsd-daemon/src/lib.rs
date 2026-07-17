@@ -534,14 +534,41 @@ pub fn bring_up(
         .get()
         .map_err(|error| std::io::Error::other(format!("cursor read: {error}")))?
         .unwrap_or_else(rsd_fsevents::current_event_id);
-    let journal = Journal::open(
-        journal_dir,
-        JournalConfig {
-            sync_on_append: cfg.journal_sync,
-            ..Default::default()
-        },
-    )
-    .map_err(|e| std::io::Error::other(format!("journal open: {e}")))?;
+    let journal_cfg = JournalConfig {
+        sync_on_append: cfg.journal_sync,
+        ..Default::default()
+    };
+    let (mut journal, repair_scope) = Journal::open_with_scoped_repair(journal_dir, journal_cfg)
+        .map_err(|e| std::io::Error::other(format!("journal open: {e}")))?;
+    let mut repair_upserts = Vec::new();
+    if let Some(repair) = repair_scope {
+        tracing::error!(
+            "journal segment quarantined at {:?}; repairing {} affected paths",
+            repair.quarantined_segment,
+            repair.paths.len()
+        );
+        let mut changes = Vec::with_capacity(repair.paths.len());
+        for path in repair.paths {
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    let stat = rsd_catalog::StatInfo::from_metadata(&metadata);
+                    if stat.kind == rsd_catalog::ObjectKind::File {
+                        repair_upserts.push((path.clone(), stat));
+                    }
+                    changes.push(rsd_catalog::Change::Upsert { path, stat });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    changes.push(rsd_catalog::Change::RemovePath { path });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !changes.is_empty() {
+            journal.append(Source::Repair, &changes).map_err(|error| {
+                std::io::Error::other(format!("journal repair append: {error}"))
+            })?;
+        }
+    }
     let mut committer = Committer::new(catalog.clone(), journal);
     if let Some((plane, caes)) = lexical {
         committer = committer.with_lexical(plane, caes);
@@ -561,6 +588,15 @@ pub fn bring_up(
         .map_err(|e| std::io::Error::other(format!("recovery: {e}")))?;
     if replayed > 0 {
         tracing::info!("recovered {replayed} journal records into the catalog");
+    }
+    if !repair_upserts.is_empty() {
+        if let Some(indexer) = content.as_mut() {
+            if !indexer.process(&mut committer, &repair_upserts) {
+                return Err(std::io::Error::other(
+                    "content repair failed for a quarantined journal segment",
+                ));
+            }
+        }
     }
 
     if cfg.trickle_bootstrap {

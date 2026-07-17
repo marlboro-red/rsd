@@ -74,6 +74,17 @@ pub struct SegmentManifest {
     pub paths: Vec<String>,
 }
 
+/// Filesystem scope whose journal history was replaced by neutral placeholders
+/// after detected corruption. The daemon must append a current-state repair
+/// for these paths before serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairScope {
+    pub paths: Vec<String>,
+    pub first_lsn: u64,
+    pub last_lsn: u64,
+    pub quarantined_segment: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct JournalConfig {
     pub segment_max_bytes: u64,
@@ -111,6 +122,22 @@ fn segment_name(first_lsn: u64) -> String {
 
 fn sync_parent(path: &Path) -> std::io::Result<()> {
     File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+}
+
+fn write_manifest(path: &Path, manifest: &SegmentManifest) -> Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("manifest")
+    ));
+    let mut file = File::create(&tmp)?;
+    file.write_all(&postcard::to_allocvec(manifest)?)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    sync_parent(path)?;
+    Ok(())
 }
 
 fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
@@ -231,6 +258,25 @@ fn scan_segment(path: &Path, mut sink: impl FnMut(LogRecord)) -> Result<SegmentS
 }
 
 impl Journal {
+    /// Open normally, or repair one checksummed corrupt segment when a durable
+    /// `.seal`/`.scope` manifest makes the blast radius explicit. The corrupt
+    /// bytes are retained under a quarantine name. The original LSN range is
+    /// filled with idempotent placeholders; callers append current-state
+    /// changes for `RepairScope::paths` at the new journal tail.
+    pub fn open_with_scoped_repair(
+        dir: &Path,
+        cfg: JournalConfig,
+    ) -> Result<(Journal, Option<RepairScope>)> {
+        match Journal::open(dir, cfg) {
+            Ok(journal) => Ok((journal, None)),
+            Err(LogError::Corrupt { segment, .. }) => {
+                let scope = repair_corrupt_segment(&segment)?;
+                Ok((Journal::open(dir, cfg)?, Some(scope)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn open(dir: &Path, cfg: JournalConfig) -> Result<Journal> {
         std::fs::create_dir_all(dir)?;
         let segments = list_segments(dir)?;
@@ -355,11 +401,16 @@ impl Journal {
             self.active_paths.insert(ch.path().to_string());
         }
         self.active.write_all(&self.scratch)?;
-        if self.cfg.sync_on_append {
-            self.active.sync_data()?;
-        }
         self.active_len += self.scratch.len() as u64;
         self.active_records += changes.len() as u64;
+        if self.cfg.sync_on_append {
+            self.active.sync_data()?;
+            // A mid-segment checksum failure cannot be repaired narrowly
+            // unless the paths represented by the unreadable suffix survive
+            // independently. Keep a durable scope manifest for the active
+            // segment; sealing promotes the same information to `.seal`.
+            self.persist_active_scope()?;
+        }
         let last = self.next_lsn - 1;
 
         if self.active_len >= self.cfg.segment_max_bytes {
@@ -375,20 +426,15 @@ impl Journal {
 
     fn seal_and_rotate(&mut self) -> Result<()> {
         self.active.sync_data()?;
-        let manifest = SegmentManifest {
-            first_lsn: self.active_first_lsn,
-            last_lsn: self.next_lsn - 1,
-            records: self.active_records,
-            paths: std::mem::take(&mut self.active_paths).into_iter().collect(),
-        };
+        let manifest = self.active_manifest();
         let seal_path = self.active_path.with_extension("seal");
-        let tmp = seal_path.with_extension("seal.tmp");
-        let mut seal = File::create(&tmp)?;
-        seal.write_all(&postcard::to_allocvec(&manifest)?)?;
-        seal.sync_all()?;
-        drop(seal);
-        std::fs::rename(&tmp, &seal_path)?;
-        sync_parent(&seal_path)?;
+        write_manifest(&seal_path, &manifest)?;
+        let scope_path = self.active_path.with_extension("scope");
+        if scope_path.exists() {
+            std::fs::remove_file(&scope_path)?;
+            sync_parent(&scope_path)?;
+        }
+        self.active_paths.clear();
 
         let first = self.next_lsn;
         let path = self.dir.join(segment_name(first));
@@ -403,6 +449,22 @@ impl Journal {
         self.active_len = 8;
         self.active_records = 0;
         Ok(())
+    }
+
+    fn active_manifest(&self) -> SegmentManifest {
+        SegmentManifest {
+            first_lsn: self.active_first_lsn,
+            last_lsn: self.next_lsn - 1,
+            records: self.active_records,
+            paths: self.active_paths.iter().cloned().collect(),
+        }
+    }
+
+    fn persist_active_scope(&self) -> Result<()> {
+        write_manifest(
+            &self.active_path.with_extension("scope"),
+            &self.active_manifest(),
+        )
     }
 
     /// Stream records with `lsn >= from` to `sink` in journal order.
@@ -452,6 +514,77 @@ impl Journal {
     pub fn segment_count(&self) -> Result<usize> {
         Ok(list_segments(&self.dir)?.len())
     }
+}
+
+fn repair_corrupt_segment(segment: &Path) -> Result<RepairScope> {
+    let manifest_path = [
+        segment.with_extension("seal"),
+        segment.with_extension("scope"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+    .ok_or_else(|| {
+        LogError::Invariant(format!(
+            "corrupt segment {segment:?} has no durable scope manifest"
+        ))
+    })?;
+    let manifest: SegmentManifest = postcard::from_bytes(&std::fs::read(&manifest_path)?)?;
+    let expected_records = manifest
+        .last_lsn
+        .checked_sub(manifest.first_lsn)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| LogError::Invariant("invalid repair manifest LSN range".into()))?;
+    if manifest.records != expected_records || manifest.paths.is_empty() {
+        return Err(LogError::Invariant(format!(
+            "invalid repair manifest for {segment:?}"
+        )));
+    }
+
+    let tmp = segment.with_extension("repair.tmp");
+    let mut replacement = File::create(&tmp)?;
+    replacement.write_all(SEGMENT_HEADER)?;
+    for (offset, lsn) in (manifest.first_lsn..=manifest.last_lsn).enumerate() {
+        let record = LogRecord {
+            lsn,
+            wall_time_ns: 0,
+            source: Source::Repair,
+            change: Change::RemovePath {
+                path: manifest.paths[offset % manifest.paths.len()].clone(),
+            },
+        };
+        let payload = postcard::to_allocvec(&record)?;
+        replacement.write_all(&[RECORD_MARKER])?;
+        replacement.write_all(&(payload.len() as u32).to_le_bytes())?;
+        replacement.write_all(&blake3::hash(&payload).as_bytes()[..HASH_LEN])?;
+        replacement.write_all(&payload)?;
+    }
+    replacement.sync_all()?;
+    drop(replacement);
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let quarantine = segment.with_extension(format!("rlog.corrupt-{stamp}"));
+    std::fs::hard_link(segment, &quarantine)?;
+    sync_parent(&quarantine)?;
+    std::fs::rename(&tmp, segment)?;
+    sync_parent(segment)?;
+
+    // The replacement closes the original range even when corruption struck
+    // the active segment. A new active segment begins after `last_lsn`.
+    write_manifest(&segment.with_extension("seal"), &manifest)?;
+    let active_scope = segment.with_extension("scope");
+    if active_scope.exists() {
+        std::fs::remove_file(&active_scope)?;
+        sync_parent(&active_scope)?;
+    }
+    Ok(RepairScope {
+        paths: manifest.paths,
+        first_lsn: manifest.first_lsn,
+        last_lsn: manifest.last_lsn,
+        quarantined_segment: quarantine,
+    })
 }
 
 /// Fenced source cursor (P2.2): "events up to here are durably journaled".
@@ -665,6 +798,37 @@ mod tests {
     }
 
     #[test]
+    fn active_corruption_is_quarantined_and_lsn_range_is_repairable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = JournalConfig {
+            segment_max_bytes: u64::MAX,
+            sync_on_append: true,
+        };
+        let seg = dir.path().join(segment_name(1));
+        {
+            let mut journal = Journal::open(dir.path(), cfg).unwrap();
+            journal
+                .append(Source::Synthetic, &[ch(1), ch(2), ch(3)])
+                .unwrap();
+        }
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes[8 + RECORD_OVERHEAD + 2] ^= 0x80;
+        std::fs::write(&seg, bytes).unwrap();
+
+        let (mut journal, repair) = Journal::open_with_scoped_repair(dir.path(), cfg).unwrap();
+        let repair = repair.expect("scope manifest enables repair");
+        assert_eq!((repair.first_lsn, repair.last_lsn), (1, 3));
+        assert_eq!(repair.paths, vec!["/t/f1", "/t/f2", "/t/f3"]);
+        assert!(repair.quarantined_segment.exists());
+        let mut records = Vec::new();
+        journal.replay(1, |record| records.push(record)).unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record.source == Source::Repair));
+
+        assert_eq!(journal.append(Source::Repair, &[ch(99)]).unwrap(), (4, 4));
+    }
+
+    #[test]
     fn fuzz_arbitrary_bytes_never_panic() {
         let mut rng = ChaCha8Rng::seed_from_u64(99);
         for trial in 0..200 {
@@ -695,5 +859,38 @@ mod tests {
         // Corrupt it: must read as None (re-deliver — the safe direction).
         std::fs::write(dir.path().join("cursor"), b"garbage").unwrap();
         assert_eq!(c.get().unwrap(), None);
+    }
+
+    #[test]
+    fn durable_active_segment_carries_a_scoped_repair_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(
+            dir.path(),
+            JournalConfig {
+                segment_max_bytes: 1 << 20,
+                sync_on_append: true,
+            },
+        )
+        .unwrap();
+        journal
+            .append(
+                Source::FsEvents,
+                &[
+                    Change::RemovePath {
+                        path: "/root/a".into(),
+                    },
+                    Change::RemovePath {
+                        path: "/root/b".into(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        let bytes = std::fs::read(journal.active_path.with_extension("scope")).unwrap();
+        let manifest: SegmentManifest = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(manifest.first_lsn, 1);
+        assert_eq!(manifest.last_lsn, 2);
+        assert_eq!(manifest.records, 2);
+        assert_eq!(manifest.paths, vec!["/root/a", "/root/b"]);
     }
 }
