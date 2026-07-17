@@ -8,7 +8,6 @@
 
 use rsd_caes::{CaesKey, Store, ABI_VERSION};
 use rsd_catalog::{Catalog, Change};
-use rsd_extract::{EXTRACTOR_ID, EXTRACTOR_VERSION};
 use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, TermQuery};
@@ -112,15 +111,27 @@ impl LexicalPlane {
         &mut self,
         first_lsn: u64,
         changes: &[Change],
+        remove_oids: &[u64],
         catalog: &Catalog,
         caes: &Store,
     ) -> Result<()> {
         let last = first_lsn + changes.len() as u64 - 1;
-        let mut dirty = false;
+        for oid in remove_oids {
+            self.writer
+                .delete_term(Term::from_field_u64(self.reader.f_oid, *oid));
+        }
         for (i, ch) in changes.iter().enumerate() {
             let lsn = first_lsn + i as u64;
             if lsn <= self.applied_lsn {
                 continue;
+            }
+            if let Change::Upsert { path, .. } = ch {
+                if let Some((oid, rec)) = catalog.get_by_path(path)? {
+                    if rec.content_hash.is_none() {
+                        self.writer
+                            .delete_term(Term::from_field_u64(self.reader.f_oid, oid));
+                    }
+                }
             }
             if let Change::SetContent {
                 path,
@@ -134,8 +145,8 @@ impl LexicalPlane {
                 };
                 let key = CaesKey {
                     content_hash: *content_hash,
-                    extractor_id: EXTRACTOR_ID.into(),
-                    extractor_version: EXTRACTOR_VERSION,
+                    extractor_id: rsd_extract::EXTRACTOR_ID.into(),
+                    extractor_version: rsd_extract::EXTRACTOR_VERSION,
                     hints_hash: *hints_hash,
                     abi_version: ABI_VERSION,
                 };
@@ -151,17 +162,77 @@ impl LexicalPlane {
                     doc.add_text(self.reader.f_symbols, sym.name.to_lowercase());
                 }
                 self.writer.add_document(doc)?;
-                dirty = true;
             }
         }
-        if dirty || last > self.applied_lsn {
-            if dirty {
-                let mut prepared = self.writer.prepare_commit()?;
-                prepared.set_payload(&last.to_string());
-                prepared.commit()?;
-            }
+        if last > self.applied_lsn {
+            let mut prepared = self.writer.prepare_commit()?;
+            prepared.set_payload(&last.to_string());
+            prepared.commit()?;
+            self.reader.reader.reload()?;
             self.applied_lsn = self.applied_lsn.max(last);
         }
+        Ok(())
+    }
+
+    /// Clear the disposable projection and reset its durable watermark.
+    pub fn reset(&mut self) -> Result<()> {
+        self.writer.delete_all_documents()?;
+        let mut prepared = self.writer.prepare_commit()?;
+        prepared.set_payload("0");
+        prepared.commit()?;
+        self.reader.reader.reload()?;
+        self.applied_lsn = 0;
+        Ok(())
+    }
+
+    pub fn remove_oids(&mut self, oids: &[u64]) -> Result<()> {
+        if oids.is_empty() {
+            return Ok(());
+        }
+        for oid in oids {
+            self.writer
+                .delete_term(Term::from_field_u64(self.reader.f_oid, *oid));
+        }
+        let mut prepared = self.writer.prepare_commit()?;
+        prepared.set_payload(&self.applied_lsn.to_string());
+        prepared.commit()?;
+        self.reader.reader.reload()?;
+        Ok(())
+    }
+
+    /// Replace the whole disposable projection with the catalog's current
+    /// content identities, sourcing every extraction from CAES.
+    pub fn rebuild_current(
+        &mut self,
+        target_lsn: u64,
+        catalog: &Catalog,
+        caes: &Store,
+    ) -> Result<()> {
+        self.writer.delete_all_documents()?;
+        for binding in catalog.content_bindings()? {
+            let key = CaesKey {
+                content_hash: binding.content_hash,
+                extractor_id: rsd_extract::EXTRACTOR_ID.into(),
+                extractor_version: rsd_extract::EXTRACTOR_VERSION,
+                hints_hash: binding.hints_hash,
+                abi_version: ABI_VERSION,
+            };
+            let Some(record) = caes.get(&key)? else {
+                continue;
+            };
+            let mut doc = TantivyDocument::default();
+            doc.add_u64(self.reader.f_oid, binding.oid);
+            doc.add_text(self.reader.f_content, &record.text);
+            for symbol in &record.symbols {
+                doc.add_text(self.reader.f_symbols, symbol.name.to_lowercase());
+            }
+            self.writer.add_document(doc)?;
+        }
+        let mut prepared = self.writer.prepare_commit()?;
+        prepared.set_payload(&target_lsn.to_string());
+        prepared.commit()?;
+        self.reader.reader.reload()?;
+        self.applied_lsn = target_lsn;
         Ok(())
     }
 
@@ -274,7 +345,7 @@ pub fn rebuild(
     for chunk in batch.chunks(4096) {
         let first = chunk[0].0;
         let changes: Vec<Change> = chunk.iter().map(|(_, c)| c.clone()).collect();
-        plane.apply(first, &changes, catalog, caes)?;
+        plane.apply(first, &changes, &[], catalog, caes)?;
     }
     Ok(plane)
 }

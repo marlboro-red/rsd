@@ -286,10 +286,11 @@ LogRecord { lsn, wall_time, source: FsEvents|Sentinel|Scan|AntiEntropy|Repair,
             content_hash, evidence: EventId|ScanGeneration }
 ```
 
-- **Source-cursor fencing**: FSEvents event IDs / ES sequence numbers advance durably
-  only after the derived records are journaled. Crash → events re-delivered;
-  idempotent application (§7.4) makes re-delivery safe. An acknowledged event is
-  never lost; an unacknowledged one is never assumed.
+- **Source-cursor fencing target**: FSEvents event IDs / ES sequence numbers advance
+  durably only after the derived records are journaled. `CursorStore` and the
+  synthetic-source crash proof ship, but the production FSEvents watcher currently
+  starts at `SINCE_NOW`; the restart bootstrap reconciliation is the correctness
+  fallback until the cursor is wired end to end.
 - The journal orders and describes transitions; it does **not** contain content
   (that's CAES) and does **not** claim complete observation of the filesystem
   (that's reconciliation's job).
@@ -354,10 +355,11 @@ freshness never waits on disk merges; merge policy tuned for 24/7 small commits.
   functions, slides, mail parts), FastCDC fallback. Chunks keyed by chunk content
   hash → an edited paragraph re-embeds one chunk, not a document; copies re-embed
   nothing.
-- **Embeddings**: quantized small model (int8, ~50–150M params) via CoreML/ANE,
-  candle+Metal fallback. Generated **asynchronously** behind lexical commit — this is
-  the second timeline, made explicit: every doc carries `(lsn, semantic_gen)`, and
-  the system emits **two delta streams** (§7.3).
+- **Embeddings target**: quantized small model (int8, ~50–150M params) via
+  CoreML/ANE, candle+Metal fallback, generated asynchronously behind lexical
+  commit. Shipping today is deliberately simpler: embedding runs synchronously
+  inside commit into a redb exact-scan projection with one semantic watermark.
+  The second timeline and two-delta-stream protocol remain targets (§7.3).
 - **ANN**: per-segment HNSW with tombstones and background rebuilds, mirroring
   tantivy's segment lifecycle; PQ tier for the long tail, full-precision cache for
   the hot set; per-segment model tags for mixed-version periods.
@@ -407,8 +409,8 @@ this matrix. Test: crash/corruption-injection CI (spikes 1–2) exercises every 
 
 | Failure | Detection | Blast radius | Repair path |
 |---|---|---|---|
-| Crash mid-commit (any instruction) | Watermark divergence at startup | Docs in flight since `min(watermarks)` | Idempotent replay from journal + CAES (§7.4) |
-| Journal segment corrupt | Record checksums / scrubber | That LSN range's *ordering* | Segment membership manifest (stored redundantly at segment seal) identifies affected objects → re-verify by stat+hash; projections already applied are unaffected |
+| Crash mid-commit (any instruction) | Watermark divergence at startup | Docs in flight | Catalog replays its journal suffix; a lagged lexical/vector plane rebuilds current object identities from catalog + CAES, avoiding path-reuse ambiguity and filesystem reads |
+| Journal segment corrupt | Record checksums on open/replay; active-segment checksum failures are hard errors, only EOF-truncated frames are tail-repaired | That LSN range's *ordering* | **Partial shipping status:** corruption is detected without truncating a valid suffix; manifest-driven scoped re-verification remains a target |
 | Lexical/vector segment corrupt | Segment checksums / scrubber | That segment's docs | Drop segment; rebuild from CAES records (segment manifests record membership); no filesystem reads needed within retention |
 | Catalog page damaged, redb recovers to prior root | redb MVCC recovery | Since-prior-root delta | Replay journal delta |
 | Catalog page damaged beyond redb recovery | Scrubber / read failure | Catalog plane | Rebuild skeleton from lexical stored fields + journal + CAES; close residual gap via anti-entropy scan of affected scopes |
@@ -447,14 +449,21 @@ continuously walks all planes at idle priority.
    content-hash+key → skip extraction); route by sniffed type to native / WASM /
    compat / media workers; pass fd; `fstat`-pin identity (§5).
 
-### 7.3 Commit — the per-LSN projection state machine
+### 7.3 Commit — shipping synchronous state machine and async target
 
 ```
 Observed → Journaled → ExtractionDurable(CAES) → CatalogApplied
         → LexicalApplied → GraphApplied → (async) SemanticApplied
 ```
 
-Single committer task; ordering rules:
+The diagram and two-stream rules below are the target. Shipping today has one
+committer thread executing journal → catalog → lexical → vector → live hook
+synchronously. Catalog, lexical, and vector keep independent watermarks; restart
+streams the catalog suffix in bounded batches and rebuilds a lagged disposable
+content plane from current catalog identities + CAES. There is no `SemanticDelta`,
+`ALLOW STALE`, or query fence at `min(watermarks)` yet.
+
+Ordering rules that do ship:
 
 - Journal append is durable **before** any projection applies (journal-before-apply).
 - CAES write is durable **before** dependent plane writes reference it.
@@ -462,11 +471,11 @@ Single committer task; ordering rules:
 - Old attribute state and the *previous* CAES record reference are captured into the
   commit delta **before** overwrite/tombstone — leave-events in live views evaluate
   against real old state (§9).
-- **Two delta streams**: `DocDelta { lsn, (id, old, new, caes_refs) }` at
+- **Two delta streams (target)**: `DocDelta { lsn, (id, old, new, caes_refs) }` at
   catalog+lexical commit; `SemanticDelta { lsn, semantic_gen, chunks }` when the
   vector batch durably commits. A semantic alert cannot fire before its vector
   exists, so it fences on the semantic watermark — stated, not hidden.
-- Queries read behind `min(plane watermarks)` by default; callers may opt into
+- **Read-fence target**: queries read behind `min(plane watermarks)` by default; callers may opt into
   `ALLOW STALE(plane)` for freshness-tolerant reads.
 
 ### 7.4 Idempotency
@@ -474,7 +483,9 @@ Single committer task; ordering rules:
 Every projection apply is keyed by `(lsn, id, plane, projection_version)` and is
 safely re-runnable: delete-before-add within a keyed apply, replays after uncertain
 commits converge to the same state. This is what makes cursor re-delivery (§6.1) and
-crash replay (§6.8) safe, and it is fuzzed by the crash-injection gate.
+crash replay (§6.8) safe. Randomized kill injection covers journal/catalog and
+content-plane convergence; byte corruption tests currently cover journal segment
+detection, while automatic scoped repair remains a target.
 
 ### 7.5 Freshness targets
 
@@ -652,6 +663,12 @@ visibility; it grants it explicitly.
     non-first-party agents; every grant visible and auditable.
 - **Transport**: XPC is the identity-bearing surface (T0). UDS remains for the
   same-product CLI during development.
+- **Shipping status (2026-07 correctness pass)**: UDS scope evaluation is
+  component-boundary-safe and deny-by-default, including unknown principals and
+  explicit empty grants. Its `Hello` principal remains caller-asserted, so the
+  daemon configures no UDS grants; verified first-party identity, persistent grant
+  management, and candidate-generation enforcement remain T0 targets. The
+  token-authenticated loopback UI surface is separate.
 - **Enforcement point**: scope filters constrain **candidate generation**, not final
   results — counts, aggregates, group-bys, rank positions, snippets, and live-view
   deltas are computed over the authorized subset only. Provenance traversal clips at
@@ -865,7 +882,9 @@ that already exist.
 - **Loopback-secret gate (§18.5.2, done first as its own fix).** The HTTP
   surface — `/api/search` included — was reachable by any web page via
   `ACAO:*` on `127.0.0.1`. Now every request requires a token from a 0600 file
-  the native app reads and a web page cannot; `ACAO:*` removed.
+  the native app reads and a web page cannot; `ACAO:*` removed. Token generation
+  fails closed if OS entropy is unavailable, and verification compares the fixed
+  32-byte token in constant time before route dispatch (including SSE routes).
 - **Flood test**: cardinality stays flat and percentiles stay finite under 1M
   samples.
 

@@ -289,6 +289,18 @@ impl WorkerPool {
         budgets: Budgets,
     ) -> Result<ExtractionRecord> {
         let file = std::fs::File::open(path)?;
+        self.extract_fd(file, hints, budgets)
+    }
+
+    /// Extract from an already-open, identity-pinned file. This is the daemon
+    /// fast path: hashing and extraction share one open file description, so
+    /// a path replacement cannot switch bytes between the two operations.
+    pub fn extract_fd(
+        &mut self,
+        file: std::fs::File,
+        hints: ExtractHints,
+        budgets: Budgets,
+    ) -> Result<ExtractionRecord> {
         match self.request(
             &WorkerRequest::Extract { hints, budgets },
             Some(OwnedFd::from(file)),

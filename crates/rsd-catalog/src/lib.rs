@@ -12,7 +12,7 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 pub use redb::Durability;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 const OBJECTS: TableDefinition<u64, &[u8]> = TableDefinition::new("objects");
@@ -143,6 +143,16 @@ pub struct ObjectRecord {
     pub index_state: Option<String>,
     /// CAES hints hash companion to content_hash (re-keys CAES from deltas).
     pub caes_hints_hash: Option<[u8; 32]>,
+}
+
+/// Current content identity for one live catalog object, with one path used to
+/// resolve it during disposable-plane reconstruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentBinding {
+    pub oid: u64,
+    pub path: String,
+    pub content_hash: [u8; 32],
+    pub hints_hash: [u8; 32],
 }
 
 /// What `apply_stat` did — used by scanners/tests for op accounting.
@@ -631,8 +641,42 @@ impl Catalog {
         Ok(out)
     }
 
-    /// Delete objects that have been orphaned longer than `grace`.
-    pub fn sweep_orphans(&self, grace: std::time::Duration) -> Result<usize> {
+    /// One binding per live object whose extraction identity is current.
+    /// Hard links are deduplicated by oid.
+    pub fn content_bindings(&self) -> Result<Vec<ContentBinding>> {
+        let txn = self.db.begin_read()?;
+        let by_path = txn.open_table(BY_PATH)?;
+        let objects = txn.open_table(OBJECTS)?;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for item in by_path.iter()? {
+            let (path, oid) = item?;
+            let oid = oid.value();
+            if !seen.insert(oid) {
+                continue;
+            }
+            let Some(record) = objects.get(oid)? else {
+                continue;
+            };
+            let record: ObjectRecord = postcard::from_bytes(record.value())?;
+            let (Some(content_hash), Some(hints_hash)) =
+                (record.content_hash, record.caes_hints_hash)
+            else {
+                continue;
+            };
+            out.push(ContentBinding {
+                oid,
+                path: path.value().to_string(),
+                content_hash,
+                hints_hash,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete objects that have been orphaned longer than `grace`, returning
+    /// their oids so disposable projections can remove them too.
+    pub fn sweep_orphan_oids(&self, grace: std::time::Duration) -> Result<Vec<u64>> {
         let cutoff = now_ns().saturating_sub(grace.as_nanos() as u64);
         self.with_write(|t| {
             let mut victims = Vec::new();
@@ -646,8 +690,12 @@ impl Catalog {
             for oid in &victims {
                 delete_object(t, *oid)?;
             }
-            Ok(victims.len())
+            Ok(victims)
         })
+    }
+
+    pub fn sweep_orphans(&self, grace: std::time::Duration) -> Result<usize> {
+        Ok(self.sweep_orphan_oids(grace)?.len())
     }
 
     pub fn entry_count(&self) -> Result<u64> {

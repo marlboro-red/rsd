@@ -131,11 +131,24 @@ pub struct Store {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let db = Database::create(path)?;
-        let txn = db.begin_write()?;
-        {
-            txn.open_table(RECORDS)?;
+        // Opening an existing authority must be read-only. Starting a schema
+        // write transaction on every daemon restart lets SIGKILL during open
+        // leave redb recovery work despite there being no CAES mutation.
+        let needs_init = {
+            let txn = db.begin_read()?;
+            match txn.open_table(RECORDS) {
+                Ok(_) => false,
+                Err(redb::TableError::TableDoesNotExist(_)) => true,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if needs_init {
+            let txn = db.begin_write()?;
+            {
+                txn.open_table(RECORDS)?;
+            }
+            txn.commit()?;
         }
-        txn.commit()?;
         Ok(Store { db })
     }
 

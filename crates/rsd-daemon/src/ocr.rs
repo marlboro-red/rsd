@@ -4,11 +4,11 @@
 //! result is a normal `ExtractionRecord`, so CAES/lexical/vector/live pick it
 //! up exactly as they do PDF text.
 
-use crate::dispatch::ContentSource;
+use crate::dispatch::{ContentSource, ProcessorKey};
 use rsd_caes::{ExtractStatus, ExtractionRecord};
 use rsd_extract::{Budgets, ExtractHints};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub struct OcrExtractor {
     helper: PathBuf,
@@ -45,12 +45,16 @@ impl OcrExtractor {
 impl ContentSource for OcrExtractor {
     fn extract_file(
         &mut self,
-        path: &Path,
+        file: &std::fs::File,
+        _path: &Path,
         _hints: &ExtractHints,
         _budgets: &Budgets,
     ) -> Result<ExtractionRecord, String> {
         let out = Command::new(&self.helper)
-            .arg(path)
+            .arg("/dev/stdin")
+            .stdin(Stdio::from(
+                file.try_clone().map_err(|error| error.to_string())?,
+            ))
             .output()
             .map_err(|e| format!("rsd-ocr spawn: {e}"))?;
         if !out.status.success() {
@@ -82,7 +86,11 @@ impl ContentSource for OcrExtractor {
         rsd_extract::is_image(name)
     }
 
-    fn processor_tag(&self) -> &str {
-        "ocr"
+    fn processor_key(&self, _name: &str) -> ProcessorKey {
+        ProcessorKey {
+            extractor_id: "rsd.ocr.vision".into(),
+            extractor_version: 1,
+            hints_tag: "recognition-level=accurate;languages=automatic".into(),
+        }
     }
 }

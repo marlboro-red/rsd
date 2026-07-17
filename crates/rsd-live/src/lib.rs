@@ -12,7 +12,7 @@
 
 use rsd_caes::{CaesKey, Store, ABI_VERSION};
 use rsd_catalog::{Delta, ObjectKind, ObjectRecord};
-use rsd_extract::{EXTRACTOR_ID, EXTRACTOR_VERSION};
+use rsd_ipc::Scope;
 use rsd_query::{eval_live, Expr};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -45,7 +45,10 @@ impl DocMatcher {
     }
 
     pub fn tokens(&self, text: &str) -> Vec<String> {
-        let mut an = self.analyzer.lock().unwrap();
+        let mut an = self
+            .analyzer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut stream = an.token_stream(text);
         let mut out = Vec::new();
         while let Some(tok) = stream.next() {
@@ -58,11 +61,13 @@ impl DocMatcher {
     /// identical to the index-side query mapping in rsd-lexical).
     pub fn matches_text(&self, doc_text: &str, query_terms: &str) -> bool {
         let doc: HashSet<String> = self.tokens(doc_text).into_iter().collect();
-        let q: Vec<String> = query_terms
+        let normalized_query = query_terms
             .split_whitespace()
-            .map(|t| t.trim_matches('*').to_lowercase())
+            .map(|term| term.trim_matches('*'))
             .filter(|t| !t.is_empty())
-            .collect();
+            .collect::<Vec<_>>()
+            .join(" ");
+        let q = self.tokens(&normalized_query);
         !q.is_empty() && q.iter().all(|t| doc.contains(t))
     }
 
@@ -101,7 +106,7 @@ struct View {
     kind: ViewKind,
     /// Scope-prefix authorization baked in at subscribe time (P5.3): deltas
     /// outside the granted prefixes are invisible — no events, no counts.
-    grants: Vec<String>,
+    scope: Scope,
     tx: mpsc::SyncSender<LiveEvent>,
     members: HashSet<u64>,
     needs_resync: bool,
@@ -114,10 +119,6 @@ pub struct LiveEngine {
     views: HashMap<u64, View>,
     next_id: u64,
     pub deltas_processed: u64,
-}
-
-fn granted(grants: &[String], path: &str) -> bool {
-    grants.is_empty() || grants.iter().any(|g| path.starts_with(g.as_str()))
 }
 
 impl LiveEngine {
@@ -143,7 +144,7 @@ impl LiveEngine {
         &mut self,
         query: &str,
         threshold: f32,
-        grants: Vec<String>,
+        scope: Scope,
         buffer: usize,
     ) -> Option<(u64, mpsc::Receiver<LiveEvent>)> {
         let qvec = self.embedder.as_ref()?.embed(query);
@@ -154,7 +155,7 @@ impl LiveEngine {
             id,
             View {
                 kind: ViewKind::Alert { qvec, threshold },
-                grants,
+                scope,
                 tx,
                 members: HashSet::new(),
                 needs_resync: false,
@@ -164,11 +165,11 @@ impl LiveEngine {
     }
 
     /// Register a view. `initial_members` come from a one-shot query fenced by
-    /// the caller before subscribing. Empty `grants` = unrestricted.
+    /// the caller before subscribing.
     pub fn subscribe(
         &mut self,
         expr: Expr,
-        grants: Vec<String>,
+        scope: Scope,
         initial_members: impl IntoIterator<Item = u64>,
         buffer: usize,
     ) -> (u64, mpsc::Receiver<LiveEvent>) {
@@ -179,7 +180,7 @@ impl LiveEngine {
             id,
             View {
                 kind: ViewKind::Expr(expr),
-                grants,
+                scope,
                 tx,
                 members: initial_members.into_iter().collect(),
                 needs_resync: false,
@@ -206,8 +207,8 @@ impl LiveEngine {
         };
         caes.get(&CaesKey {
             content_hash: ch,
-            extractor_id: EXTRACTOR_ID.into(),
-            extractor_version: EXTRACTOR_VERSION,
+            extractor_id: rsd_extract::EXTRACTOR_ID.into(),
+            extractor_version: rsd_extract::EXTRACTOR_VERSION,
             hints_hash: hh,
             abi_version: ABI_VERSION,
         })
@@ -236,7 +237,7 @@ impl LiveEngine {
                 }
             }
             for d in deltas {
-                if !granted(&view.grants, &d.path) {
+                if !view.scope.allows(&d.path) {
                     continue;
                 }
                 let new_state = d.new.as_ref().filter(|(_, r)| r.kind != ObjectKind::Dir);
@@ -362,7 +363,7 @@ mod tests {
     fn attr_view_enters_leaves_and_dedupes() {
         let mut eng = LiveEngine::new(None);
         let expr = rsd_query::parse(r#"kMDItemFSSize > 100"#).unwrap();
-        let (id, rx) = eng.subscribe(expr, vec![], [], 64);
+        let (id, rx) = eng.subscribe(expr, Scope::Unrestricted, [], 64);
 
         eng.on_commit(&[delta("/r/a", None, Some((1, 500)))]);
         assert_eq!(
@@ -394,9 +395,10 @@ mod tests {
     fn scope_grants_hide_deltas_entirely() {
         let mut eng = LiveEngine::new(None);
         let expr = rsd_query::parse(r#"kMDItemFSSize > 0"#).unwrap();
-        let (_, rx) = eng.subscribe(expr, vec!["/a/".into()], [], 64);
+        let (_, rx) = eng.subscribe(expr, Scope::paths(["/a"]), [], 64);
         eng.on_commit(&[
             delta("/a/x", None, Some((1, 10))),
+            delta("/a-private/sibling", None, Some((3, 10))),
             delta("/b/secret", None, Some((2, 10))),
         ]);
         assert!(matches!(
@@ -407,10 +409,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_path_scope_is_deny_all_for_live_deltas() {
+        let mut eng = LiveEngine::new(None);
+        let expr = rsd_query::parse(r#"kMDItemFSSize > 0"#).unwrap();
+        let (_, rx) = eng.subscribe(expr, Scope::default(), [], 64);
+        eng.on_commit(&[delta("/secret", None, Some((1, 10)))]);
+        assert!(rx.try_recv().is_err(), "deny-all scope leaked a live delta");
+    }
+
+    #[test]
     fn slow_subscriber_gets_resync_not_unbounded_buffering() {
         let mut eng = LiveEngine::new(None);
         let expr = rsd_query::parse(r#"kMDItemFSSize > 0"#).unwrap();
-        let (_, rx) = eng.subscribe(expr, vec![], [], 16);
+        let (_, rx) = eng.subscribe(expr, Scope::Unrestricted, [], 16);
         for i in 0..200u64 {
             eng.on_commit(&[delta(&format!("/r/f{i}"), None, Some((i + 1, 10)))]);
         }

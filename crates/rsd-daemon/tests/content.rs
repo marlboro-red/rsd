@@ -24,11 +24,15 @@ struct CountingSource {
 impl ContentSource for CountingSource {
     fn extract_file(
         &mut self,
-        path: &Path,
+        file: &std::fs::File,
+        _path: &Path,
         hints: &ExtractHints,
         budgets: &Budgets,
     ) -> Result<rsd_caes::ExtractionRecord, String> {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let mut file = file.try_clone().map_err(|error| error.to_string())?;
+        std::io::Seek::rewind(&mut file).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| error.to_string())?;
         if bytes.starts_with(b"POISON") {
             return Err("simulated extractor crash".into());
         }
@@ -236,4 +240,55 @@ fn repeated_failure_quarantines_with_queryable_state() {
     );
     assert!(env.counters.failures.load(Ordering::Relaxed) >= 3);
     env.pipeline.stop();
+}
+
+#[test]
+fn extraction_failure_budget_survives_daemon_restarts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let root = base.join("tree");
+    std::fs::create_dir(&root).unwrap();
+    let poison = root.join("hostile.txt");
+    std::fs::write(&poison, "POISON persistent payload").unwrap();
+    let cat =
+        Arc::new(Catalog::open_with_durability(&base.join("cat.redb"), Durability::None).unwrap());
+
+    for pass in 1..=3 {
+        let caes = Arc::new(Store::open(&base.join("caes.redb")).unwrap());
+        let indexer = ContentIndexer::new(
+            Box::new(CountingSource {
+                calls: Arc::new(AtomicU64::new(0)),
+            }),
+            caes,
+        );
+        let counters = indexer.counters.clone();
+        let (pipeline, _) = bring_up(
+            cat.clone(),
+            &base.join("journal"),
+            &root,
+            Some(indexer),
+            None,
+            None,
+            None,
+            fast_cfg(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            counters.failures.load(Ordering::Relaxed),
+            1,
+            "each daemon lifetime performs only its one budgeted retry"
+        );
+        assert_eq!(
+            counters.quarantined.load(Ordering::Relaxed),
+            u64::from(pass == 3)
+        );
+        pipeline.stop();
+    }
+
+    let (_, record) = cat
+        .get_by_path(&poison.to_string_lossy())
+        .unwrap()
+        .expect("hostile file remains cataloged");
+    assert_eq!(record.index_state.as_deref(), Some("quarantined"));
 }

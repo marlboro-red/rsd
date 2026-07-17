@@ -34,8 +34,10 @@ fn speech_is_transcribed_into_an_extraction_record() {
     let mut t = TranscribeExtractor::at(bin, model);
     assert!(t.handles("clip.wav"));
     assert!(!t.handles("notes.txt"));
+    let file = std::fs::File::open(&wav).unwrap();
     let rec = t
         .extract_file(
+            &file,
             &wav,
             &ExtractHints {
                 name: "clip.wav".into(),

@@ -8,29 +8,41 @@
 //!   GET /api/search?q=<query>&mode=hybrid|lexical|semantic|rql&limit=N
 //!   GET /api/status
 
+use crate::connection_limit::ConnectionLimit;
 use crate::ipc::IpcCtx;
 use rsd_caes::{CaesKey, ABI_VERSION};
-use rsd_extract::{EXTRACTOR_ID, EXTRACTOR_VERSION};
+use rsd_ipc::Scope;
 use rsd_lexical::LexicalReader;
 use rsd_query::{parse, QueryEngine};
 use serde_json::json;
-use std::io::Read as _;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
+const MAX_CONNECTIONS: usize = 128;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 32 hex chars from the OS RNG — the loopback secret.
-pub fn gen_token() -> String {
+pub fn gen_token() -> std::io::Result<String> {
     let mut buf = [0u8; 16];
-    // /dev/urandom needs no crate; fall back to time-mixed if it ever fails.
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom::fill(&mut buf)
+        .map_err(|error| std::io::Error::other(format!("OS entropy unavailable: {error}")))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Write the token 0600 (user-only), atomically.
+fn token_matches(expected: &str, presented: &str) -> bool {
+    let Ok(expected): Result<&[u8; 32], _> = expected.as_bytes().try_into() else {
+        return false;
+    };
+    let mut candidate = [0u8; 32];
+    let copied = presented.len().min(candidate.len());
+    candidate[..copied].copy_from_slice(&presented.as_bytes()[..copied]);
+    constant_time_eq::constant_time_eq_32(expected, &candidate) & (presented.len() == 32)
+}
+
+/// Write the token 0600 (user-only), durably and atomically.
 pub fn write_token(path: &std::path::Path, token: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let tmp = path.with_extension("token.tmp");
@@ -42,7 +54,9 @@ pub fn write_token(path: &std::path::Path, token: &str) -> std::io::Result<()> {
         .open(&tmp)?;
     f.write_all(token.as_bytes())?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(path.parent().unwrap_or_else(|| std::path::Path::new(".")))?.sync_all()
 }
 
 pub fn start_http(
@@ -53,15 +67,25 @@ pub fn start_http(
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let ctx = Arc::new((ctx, caes, token));
+    let connections = ConnectionLimit::new(MAX_CONNECTIONS);
     std::thread::Builder::new()
         .name("rsd-http".into())
         .spawn(move || {
             for conn in listener.incoming() {
-                let Ok(stream) = conn else { continue };
+                let Ok(mut stream) = conn else { continue };
+                let Some(permit) = connections.try_acquire() else {
+                    let _ = respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        r#"{"error":"connection limit reached"}"#,
+                    );
+                    continue;
+                };
                 let ctx = ctx.clone();
                 let _ = std::thread::Builder::new()
                     .name("rsd-http-conn".into())
                     .spawn(move || {
+                        let _permit = permit;
                         let _ = serve(stream, &ctx.0, ctx.1.as_deref(), &ctx.2);
                     });
             }
@@ -126,18 +150,16 @@ fn serve(
     caes: Option<&rsd_caes::Store>,
     token: &str,
 ) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(HEADER_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let head = read_header(&mut reader)?;
+    let mut lines = head.lines();
+    let line = lines.next().unwrap_or("");
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
     // Drain headers, capturing the auth header.
     let mut header_token: Option<String> = None;
-    loop {
-        let mut h = String::new();
-        if reader.read_line(&mut h)? == 0 || h == "\r\n" || h == "\n" {
-            break;
-        }
+    for h in lines {
         if let Some(v) = h
             .strip_prefix("X-RSD-Token:")
             .or_else(|| h.strip_prefix("x-rsd-token:"))
@@ -160,7 +182,7 @@ fn serve(
     // token lives in a 0600 file only the user can read; a web page can send a
     // request but cannot read the secret, so it cannot authenticate.
     let presented = get("token").or(header_token).unwrap_or_default();
-    if presented.as_bytes() != token.as_bytes() {
+    if !token_matches(token, &presented) {
         return respond(
             &mut stream,
             "403 Forbidden",
@@ -192,13 +214,19 @@ fn serve(
         "/api/search" => {
             let q = get("q").unwrap_or_default();
             let mode = get("mode").unwrap_or_else(|| "hybrid".into());
-            let limit = get("limit").and_then(|l| l.parse().ok()).unwrap_or(25usize);
+            let limit = get("limit")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(25usize)
+                .clamp(1, 1_000);
             if q.trim().is_empty() {
                 return respond(&mut stream, "200 OK", r#"{"hits":[],"ms":0}"#);
             }
             let t0 = std::time::Instant::now();
             let lexical = LexicalReader::open(&ctx.lexical_dir).ok();
-            let vguard = ctx.vector.as_ref().map(|v| v.lock().unwrap());
+            let vguard = ctx
+                .vector
+                .as_ref()
+                .map(|vector| vector.lock().unwrap_or_else(|error| error.into_inner()));
             let engine = QueryEngine {
                 catalog: &ctx.catalog,
                 lexical: lexical.as_ref(),
@@ -260,11 +288,11 @@ fn serve(
             let threshold: f32 = get("threshold")
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(0.35);
-            let sub = ctx
-                .live
-                .lock()
-                .unwrap()
-                .subscribe_alert(&q, threshold, vec![], 1024);
+            let sub =
+                ctx.live
+                    .lock()
+                    .unwrap()
+                    .subscribe_alert(&q, threshold, Scope::Unrestricted, 1024);
             match sub {
                 Some((_, rx)) => sse_forward(&mut stream, rx),
                 None => respond(
@@ -278,6 +306,46 @@ fn serve(
     }
 }
 
+/// Read an HTTP request head without allowing a pre-auth peer to grow a
+/// `String` without bound. `fill_buf` itself has fixed capacity; this function
+/// copies at most `MAX_HEADER_BYTES` before rejecting the request.
+fn read_header(reader: &mut impl BufRead) -> std::io::Result<String> {
+    let mut bytes = Vec::with_capacity(1024);
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break;
+        }
+        let available_len = available.len();
+        let remaining = MAX_HEADER_BYTES.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request headers exceed limit",
+            ));
+        }
+        let take = available_len.min(remaining);
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n")
+            || bytes.windows(2).any(|window| window == b"\n\n")
+        {
+            return String::from_utf8(bytes)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad header"));
+        }
+        if take < available_len || bytes.len() == MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request headers exceed limit",
+            ));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "incomplete HTTP request headers",
+    ))
+}
+
 fn sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
     write!(
         stream,
@@ -286,7 +354,11 @@ fn sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
 }
 
 fn sse_view(stream: &mut TcpStream, ctx: &IpcCtx, expr: rsd_query::Expr) -> std::io::Result<()> {
-    let (_, rx) = ctx.live.lock().unwrap().subscribe(expr, vec![], [], 4096);
+    let (_, rx) = ctx
+        .live
+        .lock()
+        .unwrap()
+        .subscribe(expr, Scope::Unrestricted, [], 4096);
     sse_forward(stream, rx)
 }
 
@@ -329,26 +401,83 @@ fn snippet(ctx: &IpcCtx, caes: Option<&rsd_caes::Store>, oid: u64, q: &str) -> S
     };
     let Ok(Some(er)) = caes.get(&CaesKey {
         content_hash: ch,
-        extractor_id: EXTRACTOR_ID.into(),
-        extractor_version: EXTRACTOR_VERSION,
+        extractor_id: rsd_extract::EXTRACTOR_ID.into(),
+        extractor_version: rsd_extract::EXTRACTOR_VERSION,
         hints_hash: hh,
         abi_version: ABI_VERSION,
     }) else {
         return String::new();
     };
-    let lower = er.text.to_lowercase();
-    let needle = q.split_whitespace().next().unwrap_or(q).to_lowercase();
-    let pos = lower.find(&needle).unwrap_or(0);
+    snippet_window(&er.text, q)
+}
+
+fn snippet_window(text: &str, query: &str) -> String {
+    let needle = query.split_whitespace().next().unwrap_or(query);
+    let pos = text.find(needle).or_else(|| {
+        text.char_indices().find_map(|(start, _)| {
+            let end = start.checked_add(needle.len())?;
+            (end <= text.len()
+                && text.is_char_boundary(end)
+                && text[start..end].eq_ignore_ascii_case(needle))
+            .then_some(start)
+        })
+    });
+    let pos = pos.unwrap_or(0);
     let mut start = pos.saturating_sub(60);
-    let mut end = (pos + 140).min(er.text.len());
-    while !er.text.is_char_boundary(start) {
+    let mut end = pos.saturating_add(140).min(text.len());
+    while !text.is_char_boundary(start) {
         start -= 1;
     }
-    while !er.text.is_char_boundary(end) {
+    while !text.is_char_boundary(end) {
         end -= 1;
     }
-    er.text[start..end]
+    text[start..end]
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_tokens_are_random_fixed_width_hex() {
+        let first = gen_token().unwrap();
+        let second = gen_token().unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn token_comparison_requires_an_exact_match() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(token_matches(token, token));
+        assert!(!token_matches(token, "0123456789abcdef0123456789abcdee"));
+        assert!(!token_matches(token, "0123456789abcdef"));
+        assert!(!token_matches(token, ""));
+    }
+
+    #[test]
+    fn request_headers_are_size_bounded() {
+        let valid = b"GET /api/status HTTP/1.1\r\nX-RSD-Token: token\r\n\r\n";
+        assert_eq!(
+            read_header(&mut std::io::Cursor::new(valid)).unwrap(),
+            String::from_utf8(valid.to_vec()).unwrap()
+        );
+
+        let oversized = vec![b'x'; MAX_HEADER_BYTES + 1];
+        let error = read_header(&mut std::io::Cursor::new(oversized)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn snippet_offsets_stay_on_original_unicode_boundaries() {
+        let text = "İstanbul planning notes and meeting summary";
+        assert_eq!(
+            snippet_window(text, "istanbul"),
+            "İstanbul planning notes and meeting summary"
+        );
+    }
 }

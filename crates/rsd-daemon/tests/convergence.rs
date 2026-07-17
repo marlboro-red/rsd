@@ -35,6 +35,7 @@ struct Env {
     _tmp: tempfile::TempDir,
     root: PathBuf,
     journal_dir: PathBuf,
+    catalog_path: PathBuf,
     cat: Arc<Catalog>,
 }
 
@@ -46,14 +47,64 @@ fn setup(files: usize, seed: u64) -> Env {
     if files > 0 {
         gen_tree(&root, files, seed).unwrap();
     }
-    let cat =
-        Arc::new(Catalog::open_with_durability(&base.join("cat.redb"), Durability::None).unwrap());
+    let catalog_path = base.join("cat.redb");
+    let cat = Arc::new(Catalog::open_with_durability(&catalog_path, Durability::None).unwrap());
     Env {
         _tmp: tmp,
         journal_dir: base.join("journal"),
+        catalog_path,
         root,
         cat,
     }
+}
+
+#[test]
+fn restart_reconciles_mutations_that_happened_while_stopped() {
+    let env = setup(80, 61);
+    let (pipeline, _) = bring_up(
+        env.cat.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        None,
+        None,
+        None,
+        fast_cfg(),
+    )
+    .unwrap();
+    assert_converged(&env.cat, &env.root);
+    pipeline.stop();
+
+    std::fs::write(env.root.join("created-while-down.txt"), "new").unwrap();
+    let existing = env
+        .cat
+        .listing()
+        .unwrap()
+        .keys()
+        .find(|path| Path::new(path).is_file())
+        .cloned()
+        .expect("seed file");
+    std::fs::remove_file(existing).unwrap();
+    drop(env.cat);
+
+    // Reopen the actual persistent catalog and pipeline. Blocking bootstrap
+    // must close the watcher downtime gap before bring_up returns.
+    let catalog =
+        Arc::new(Catalog::open_with_durability(&env.catalog_path, Durability::None).unwrap());
+    let (pipeline, _) = bring_up(
+        catalog.clone(),
+        &env.journal_dir,
+        &env.root,
+        None,
+        None,
+        None,
+        None,
+        fast_cfg(),
+    )
+    .unwrap();
+    assert_converged(&catalog, &env.root);
+    catalog.check_invariants().unwrap();
+    pipeline.stop();
 }
 
 /// Poll until the catalog converges to the filesystem or the deadline passes.

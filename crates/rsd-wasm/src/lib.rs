@@ -73,6 +73,9 @@ pub struct Plugin {
     engine: Engine,
     module: Module,
     pub name: String,
+    /// Full module-byte revision; changing a plugin changes its CAES identity
+    /// even when the filename and declared extensions stay the same.
+    pub revision: String,
     pub extensions: Vec<String>,
 }
 
@@ -96,6 +99,7 @@ impl Plugin {
     /// Compile a plugin and read its declared extensions. Runs the plugin once
     /// (for `rsd_extensions`) under the full sandbox.
     pub fn load(engine: &Engine, path: &Path) -> Result<Plugin> {
+        let module_bytes = std::fs::read(path)?;
         let module = Module::from_file(engine, path).map_err(werr)?;
         let name = path
             .file_stem()
@@ -132,6 +136,7 @@ impl Plugin {
             engine: engine.clone(),
             module,
             name,
+            revision: blake3::hash(&module_bytes).to_hex().to_string(),
             extensions,
         })
     }
@@ -139,6 +144,9 @@ impl Plugin {
     /// Build from an already-compiled module (tests, embedded plugins): still
     /// checks ABI + reads declared extensions through the sandbox.
     pub fn load_from_module(engine: &Engine, module: Module, name: &str) -> Result<Plugin> {
+        let revision = blake3::hash(&module.serialize().map_err(werr)?)
+            .to_hex()
+            .to_string();
         let (mut store, instance) = Self::instantiate(engine, &module)?;
         let abi = instance
             .get_typed_func::<(), i32>(&mut store, "rsd_abi_version")
@@ -167,6 +175,7 @@ impl Plugin {
             engine: engine.clone(),
             module,
             name: name.to_string(),
+            revision,
             extensions,
         })
     }
@@ -295,6 +304,12 @@ impl PluginHost {
         self.by_ext.contains_key(&ext.to_lowercase())
     }
 
+    pub fn plugin_identity(&self, ext: &str) -> Option<(&str, &str)> {
+        let idx = *self.by_ext.get(&ext.to_lowercase())?;
+        let plugin = &self.plugins[idx];
+        Some((&plugin.name, &plugin.revision))
+    }
+
     pub fn plugin_count(&self) -> usize {
         self.plugins.len()
     }
@@ -354,6 +369,7 @@ mod tests {
             engine: host.engine().clone(),
             module,
             name: "echo".into(),
+            revision: "test-echo-v1".into(),
             extensions: vec!["foo".into()],
         };
         host.add(plugin);
@@ -399,6 +415,7 @@ mod tests {
             engine: host.engine().clone(),
             module,
             name: "bomb".into(),
+            revision: "test-bomb-v1".into(),
             extensions: vec!["bomb".into()],
         });
         let r = host.extract("bomb", b"x").unwrap();

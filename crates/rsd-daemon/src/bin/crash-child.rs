@@ -8,8 +8,9 @@ use rsd_catalog::{Change, Durability};
 use rsd_daemon::commit::{synth, Committer};
 use rsd_log::{CursorStore, Journal, JournalConfig, Source};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-const BATCH: u64 = 16;
+const BATCH: u64 = 128;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -39,10 +40,19 @@ fn run(dir: &Path, ops: u64) -> Result<(), Box<dyn std::error::Error>> {
         &dir.join("journal"),
         JournalConfig {
             sync_on_append: false,
-            segment_max_bytes: 32 * 1024, // force sealing under crashes
+            segment_max_bytes: 8 * 1024, // force sealing under crashes
         },
     )?;
-    let mut committer = Committer::new(catalog, journal);
+    let caes = Arc::new(rsd_caes::Store::open(&dir.join("caes.redb"))?);
+    let (lexical, _) = rsd_daemon::open_lexical_resilient(&dir.join("lexical"))?;
+    let (vector, _) = rsd_daemon::open_vector_resilient(
+        &dir.join("vector.redb"),
+        Arc::new(rsd_vector::HashEmbedder::default()),
+    )?;
+    let vector = Arc::new(Mutex::new(vector));
+    let mut committer = Committer::new(catalog, journal)
+        .with_lexical(lexical, caes.clone())
+        .with_vector(vector, caes);
     committer.recover()?;
 
     let cursor = CursorStore::new(&dir.join("cursor"));
@@ -58,5 +68,8 @@ fn run(dir: &Path, ops: u64) -> Result<(), Box<dyn std::error::Error>> {
         cursor.set(end)?;
         i = end;
     }
+    // Production sweeps on the applier's idle timer. The finite synthetic run
+    // performs the same derived cleanup explicitly before declaring success.
+    committer.sweep_orphans(std::time::Duration::ZERO)?;
     Ok(())
 }

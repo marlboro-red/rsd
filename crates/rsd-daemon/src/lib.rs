@@ -7,6 +7,7 @@
 //! to a *counted* scoped rescan and self-heals on the applier thread.
 
 pub mod commit;
+mod connection_limit;
 pub mod dispatch;
 pub mod http;
 pub mod ipc;
@@ -83,6 +84,7 @@ pub struct Pipeline {
     applier: Option<JoinHandle<()>>,
     pub counters: Arc<PipelineCounters>,
     pub stats: Arc<Mutex<ScanStats>>,
+    pub applier_down: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
 }
 
@@ -108,6 +110,7 @@ impl Pipeline {
         let counters = Arc::new(PipelineCounters::default());
         let stats = Arc::new(Mutex::new(ScanStats::default()));
         let stopping = Arc::new(AtomicBool::new(false));
+        let applier_down = Arc::new(AtomicBool::new(false));
 
         let (ingest_tx, ingest_rx) = mpsc::channel::<IngestEvent>();
         let (work_tx, work_rx) = mpsc::sync_channel::<WorkItem>(cfg.work_capacity);
@@ -162,12 +165,19 @@ impl Pipeline {
             let stats = stats.clone();
             let grace = cfg.orphan_grace;
             let root = root.to_path_buf();
+            let applier_down_thread = applier_down.clone();
             std::thread::Builder::new()
                 .name("rsd-applier".into())
                 .spawn(move || {
-                    run_applier(
-                        committer, content, work_rx, &counters, &stats, grace, overflow, &root,
-                    )
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_applier(
+                            committer, content, work_rx, &counters, &stats, grace, overflow, &root,
+                        )
+                    }));
+                    if result.is_err() {
+                        applier_down_thread.store(true, Ordering::Release);
+                        tracing::error!("health.applier_down=1: applier thread panicked");
+                    }
                 })?
         };
 
@@ -178,6 +188,7 @@ impl Pipeline {
             applier: Some(applier),
             counters,
             stats,
+            applier_down,
             stopping,
         })
     }
@@ -215,7 +226,10 @@ fn run_applier(
                               source: Source| {
         match resolve_work(committer.catalog(), item) {
             Ok((changes, s)) => {
-                stats.lock().unwrap().absorb(s);
+                stats
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .absorb(s);
                 match committer.commit(source, &changes) {
                     Ok(Some(_)) => {
                         counters.commits.fetch_add(1, Ordering::Relaxed);
@@ -275,7 +289,7 @@ fn run_applier(
                 // Idle: reclaim orphaned identities past their grace window.
                 // Unjournaled by design: orphan GC is derived state, replay
                 // regenerates and re-sweeps it.
-                match committer.catalog().sweep_orphans(grace) {
+                match committer.sweep_orphans(grace) {
                     Ok(n) if n > 0 => {
                         counters
                             .orphans_swept
@@ -318,6 +332,57 @@ pub fn open_catalog_resilient(
             let c = attempt(path)
                 .map_err(|e| std::io::Error::other(format!("catalog recreate: {e}")))?;
             Ok((Arc::new(c), true))
+        }
+    }
+}
+
+/// Open the lexical projection, recreating it when Tantivy cannot recover it.
+/// The caller's normal journal+CAES recovery immediately repopulates it.
+pub fn open_lexical_resilient(path: &Path) -> std::io::Result<(rsd_lexical::LexicalPlane, bool)> {
+    let attempt = || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rsd_lexical::LexicalPlane::open(path)
+        }))
+        .map_err(|_| "tantivy panicked opening the projection".to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
+    };
+    match attempt() {
+        Ok(plane) => Ok((plane, false)),
+        Err(first_error) => {
+            tracing::warn!("lexical projection at {path:?} unopenable ({first_error}); rebuilding");
+            if path.exists() {
+                std::fs::remove_dir_all(path)?;
+            }
+            attempt()
+                .map(|plane| (plane, true))
+                .map_err(|error| std::io::Error::other(format!("lexical recreate: {error}")))
+        }
+    }
+}
+
+/// Open the vector projection, recreating its single-file redb store when it
+/// is unopenable. Journal+CAES recovery restores it before serving queries.
+pub fn open_vector_resilient(
+    path: &Path,
+    embedder: Arc<dyn rsd_vector::Embedder>,
+) -> std::io::Result<(rsd_vector::VectorPlane, bool)> {
+    let attempt = || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rsd_vector::VectorPlane::open(path, embedder.clone())
+        }))
+        .map_err(|_| "redb panicked opening the vector projection".to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()))
+    };
+    match attempt() {
+        Ok(plane) => Ok((plane, false)),
+        Err(first_error) => {
+            tracing::warn!("vector projection at {path:?} unopenable ({first_error}); rebuilding");
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+            attempt()
+                .map(|plane| (plane, true))
+                .map_err(|error| std::io::Error::other(format!("vector recreate: {error}")))
         }
     }
 }
@@ -442,7 +507,9 @@ pub fn bring_up(
     }
     if let Some(live) = live {
         committer.set_on_commit(Box::new(move |deltas| {
-            live.lock().unwrap().on_commit(deltas);
+            live.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .on_commit(deltas);
         }));
     }
     let replayed = committer

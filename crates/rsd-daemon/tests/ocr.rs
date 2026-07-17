@@ -6,17 +6,19 @@ use rsd_daemon::dispatch::ContentSource;
 use rsd_daemon::ocr::OcrExtractor;
 use rsd_extract::{Budgets, ExtractHints};
 
-fn helper() -> Option<std::path::PathBuf> {
-    let p = std::path::PathBuf::from(std::env::var("RSD_OCR_BIN").ok()?);
-    p.exists().then_some(p)
-}
-
 #[test]
 fn image_text_is_recognized_and_becomes_an_extraction_record() {
-    let Some(bin) = helper() else {
-        eprintln!("RSD_OCR_BIN unset/missing — skipping OCR test");
-        return;
+    let bin = match std::env::var_os("RSD_OCR_BIN") {
+        Some(path) => std::path::PathBuf::from(path),
+        None if std::env::var_os("RSD_CI_HELPERS_REQUIRED").is_some() => {
+            panic!("CI requires RSD_OCR_BIN; helper build/export was skipped")
+        }
+        None => {
+            eprintln!("RSD_OCR_BIN unset — skipping OCR test outside helper CI");
+            return;
+        }
     };
+    assert!(bin.exists(), "RSD_OCR_BIN does not exist: {bin:?}");
     let dir = tempfile::tempdir().unwrap();
     let img = dir.path().join("shot.png");
     // Render a known phrase, then OCR it back.
@@ -29,8 +31,10 @@ fn image_text_is_recognized_and_becomes_an_extraction_record() {
     assert!(status.success());
 
     let mut ocr = OcrExtractor::at(bin);
+    let file = std::fs::File::open(&img).unwrap();
     let rec = ocr
         .extract_file(
+            &file,
             &img,
             &ExtractHints {
                 name: "shot.png".into(),

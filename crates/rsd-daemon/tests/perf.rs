@@ -142,7 +142,7 @@ fn lexical_query_latency_100k_docs() {
         let first = lsn;
         lsn += changes.len() as u64;
         catalog.apply_changes(first, &changes).unwrap();
-        plane.apply(first, &changes, &catalog, &caes).unwrap();
+        plane.apply(first, &changes, &[], &catalog, &caes).unwrap();
     }
     println!(
         "built 100k-doc corpus in {:?} ({} docs)",

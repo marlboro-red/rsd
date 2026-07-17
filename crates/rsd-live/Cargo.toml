@@ -11,6 +11,7 @@ workspace = true
 rsd-catalog = { workspace = true }
 rsd-caes = { workspace = true }
 rsd-extract = { workspace = true }
+rsd-ipc = { workspace = true }
 rsd-query = { workspace = true }
 rsd-vector = { workspace = true }
 tantivy = { workspace = true }

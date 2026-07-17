@@ -17,12 +17,16 @@ struct Src;
 impl ContentSource for Src {
     fn extract_file(
         &mut self,
-        path: &std::path::Path,
+        file: &std::fs::File,
+        _path: &std::path::Path,
         hints: &ExtractHints,
         budgets: &Budgets,
     ) -> Result<rsd_caes::ExtractionRecord, String> {
         let _ = AtomicU64::new(0);
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let mut file = file.try_clone().map_err(|error| error.to_string())?;
+        std::io::Seek::rewind(&mut file).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| error.to_string())?;
         Ok(extract_bytes(hints, budgets, &bytes))
     }
 }
@@ -151,6 +155,8 @@ fn semantic_alert_fires_on_similar_content_only() {
     )
     .unwrap();
     let sock = base.join("rsd.sock");
+    let mut authz = AuthzStore::default();
+    authz.grant_unrestricted("t");
     start_ipc(
         &sock,
         IpcCtx {
@@ -158,7 +164,7 @@ fn semantic_alert_fires_on_similar_content_only() {
             lexical_dir: base.join("lexical"),
             vector: None,
             live,
-            authz: Arc::new(AuthzStore::default()),
+            authz: Arc::new(authz),
         },
     )
     .unwrap();

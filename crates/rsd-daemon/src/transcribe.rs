@@ -11,18 +11,30 @@
 //! both the helper and a fetched whisper model. Otherwise media files stay
 //! unindexed-by-policy rather than silently burning CPU on a music library.
 
-use crate::dispatch::ContentSource;
+use crate::dispatch::{ContentSource, ProcessorKey};
 use rsd_caes::{ExtractStatus, ExtractionRecord};
 use rsd_extract::{Budgets, ExtractHints};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub struct TranscribeExtractor {
     helper: PathBuf,
     model: PathBuf,
+    model_revision: String,
 }
 
 impl TranscribeExtractor {
+    fn model_revision(model: &Path) -> String {
+        let metadata = std::fs::metadata(model).ok();
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = metadata
+            .and_then(|m| m.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!("{}:{size}:{modified}", model.display())
+    }
+
     /// Default model location, matching scripts/fetch-model.sh.
     pub fn default_model() -> PathBuf {
         if let Ok(p) = std::env::var("RSD_WHISPER_MODEL") {
@@ -50,23 +62,37 @@ impl TranscribeExtractor {
         if !model.exists() {
             return None;
         }
-        Some(TranscribeExtractor { helper, model })
+        let model_revision = Self::model_revision(&model);
+        Some(TranscribeExtractor {
+            helper,
+            model,
+            model_revision,
+        })
     }
 
     pub fn at(helper: PathBuf, model: PathBuf) -> TranscribeExtractor {
-        TranscribeExtractor { helper, model }
+        let model_revision = Self::model_revision(&model);
+        TranscribeExtractor {
+            helper,
+            model,
+            model_revision,
+        }
     }
 }
 
 impl ContentSource for TranscribeExtractor {
     fn extract_file(
         &mut self,
-        path: &Path,
+        file: &std::fs::File,
+        _path: &Path,
         _hints: &ExtractHints,
         _budgets: &Budgets,
     ) -> Result<ExtractionRecord, String> {
         let out = Command::new(&self.helper)
-            .arg(path)
+            .arg("/dev/stdin")
+            .stdin(Stdio::from(
+                file.try_clone().map_err(|error| error.to_string())?,
+            ))
             .arg("--model")
             .arg(&self.model)
             .output()
@@ -98,7 +124,11 @@ impl ContentSource for TranscribeExtractor {
         rsd_extract::is_media(name)
     }
 
-    fn processor_tag(&self) -> &str {
-        "stt"
+    fn processor_key(&self, _name: &str) -> ProcessorKey {
+        ProcessorKey {
+            extractor_id: "rsd.transcribe.whisper".into(),
+            extractor_version: 1,
+            hints_tag: format!("model={}", self.model_revision),
+        }
     }
 }

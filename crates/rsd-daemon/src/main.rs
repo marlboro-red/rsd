@@ -6,7 +6,7 @@
 //! state inside the root would generate events about its own writes and feed
 //! back into the pipeline forever.
 
-use rsd_catalog::{Catalog, Durability};
+use rsd_catalog::Durability;
 use rsd_daemon::{bring_up, PipelineConfig};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -60,10 +60,11 @@ fn main() -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&state)?;
 
-    let catalog = Arc::new(
-        Catalog::open_with_durability(&state.join("catalog.redb"), Durability::Eventual)
-            .map_err(|e| std::io::Error::other(e.to_string()))?,
-    );
+    let (catalog, catalog_rebuilt) =
+        rsd_daemon::open_catalog_resilient(&state.join("catalog.redb"), Durability::Eventual)?;
+    if catalog_rebuilt {
+        eprintln!("catalog: rebuilding projection from journal");
+    }
 
     // Content indexing: sealed worker pool, if the worker binary is present.
     let (content, lexical) = match rsd_worker::WorkerPool::new(rsd_worker::PoolConfig::default()) {
@@ -72,8 +73,11 @@ fn main() -> std::io::Result<()> {
                 rsd_caes::Store::open(&state.join("caes.redb"))
                     .map_err(|e| std::io::Error::other(e.to_string()))?,
             );
-            let plane = rsd_lexical::LexicalPlane::open(&state.join("lexical"))
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let (plane, lexical_rebuilt) =
+                rsd_daemon::open_lexical_resilient(&state.join("lexical"))?;
+            if lexical_rebuilt {
+                eprintln!("lexical: rebuilding projection from journal + CAES");
+            }
             let mut indexer = rsd_daemon::ContentIndexer::new(
                 Box::new(rsd_daemon::PooledExtractor(pool)),
                 caes.clone(),
@@ -135,11 +139,17 @@ fn main() -> std::io::Result<()> {
                 }
             }
         };
-    let vector = lexical.as_ref().map(|(_, caes)| {
-        let plane = rsd_vector::VectorPlane::open(&state.join("vector.redb"), embedder.clone())
-            .expect("vector plane");
-        (Arc::new(std::sync::Mutex::new(plane)), caes.clone())
-    });
+    let vector = lexical
+        .as_ref()
+        .map(|(_, caes)| -> std::io::Result<_> {
+            let (plane, vector_rebuilt) =
+                rsd_daemon::open_vector_resilient(&state.join("vector.redb"), embedder.clone())?;
+            if vector_rebuilt {
+                eprintln!("vector: rebuilding projection from journal + CAES");
+            }
+            Ok((Arc::new(std::sync::Mutex::new(plane)), caes.clone()))
+        })
+        .transpose()?;
     let vector_handle = vector.as_ref().map(|(p, _)| p.clone());
     let vector_handle_http = vector_handle.clone();
     let lexical_caes = lexical.as_ref().map(|(_, c)| c.clone());
@@ -181,7 +191,7 @@ fn main() -> std::io::Result<()> {
     // Loopback secret for the HTTP surface: a random token in a 0600 file the
     // native app reads. Without it, any web page could read the index over
     // 127.0.0.1. Regenerated each start.
-    let token = rsd_daemon::http::gen_token();
+    let token = rsd_daemon::http::gen_token()?;
     let token_path = state.join("http.token");
     rsd_daemon::http::write_token(&token_path, &token)?;
 
@@ -207,9 +217,12 @@ fn main() -> std::io::Result<()> {
 
     loop {
         std::thread::sleep(Duration::from_secs(5));
-        let s = *pipeline.stats.lock().unwrap();
+        let s = *pipeline
+            .stats
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         eprintln!(
-            "entries={} objects={} work_items={} commits={} full_rescans={} lstats={} removals={} bootstrap_dirs={}{}",
+            "entries={} objects={} work_items={} commits={} full_rescans={} lstats={} removals={} bootstrap_dirs={} applier_down={}{}",
             catalog.entry_count().unwrap_or(0),
             catalog.object_count().unwrap_or(0),
             pipeline.counters.work_items.load(Ordering::Relaxed),
@@ -218,6 +231,7 @@ fn main() -> std::io::Result<()> {
             s.lstats,
             s.removals,
             pipeline.counters.bootstrap_dirs.load(Ordering::Relaxed),
+            pipeline.applier_down.load(Ordering::Acquire),
             if pipeline.counters.bootstrap_done.load(Ordering::Relaxed) == 1 {
                 " (done)"
             } else {

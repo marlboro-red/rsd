@@ -16,7 +16,6 @@
 use redb::{Database, ReadableTable, TableDefinition};
 use rsd_caes::{CaesKey, Store, ABI_VERSION};
 use rsd_catalog::{Catalog, Change};
-use rsd_extract::{EXTRACTOR_ID, EXTRACTOR_VERSION};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -35,6 +34,8 @@ pub enum VectorError {
     Catalog(#[from] rsd_catalog::CatalogError),
     #[error("caes: {0}")]
     Caes(#[from] rsd_caes::CaesError),
+    #[error("embedding unavailable: {0}")]
+    Embedding(String),
 }
 
 macro_rules! from_redb {
@@ -179,6 +180,24 @@ pub struct SemanticHit {
 }
 
 impl VectorPlane {
+    fn embed_chunks(&self, text: &str) -> Result<Vec<(u32, Vec<f32>)>> {
+        chunk(text)
+            .into_iter()
+            .map(|(offset, text)| {
+                let vector = self.embedder.embed(&text);
+                if vector.len() != self.embedder.dim()
+                    || vector.iter().any(|value| !value.is_finite())
+                    || vector.iter().all(|value| *value == 0.0)
+                {
+                    return Err(VectorError::Embedding(
+                        "helper returned an invalid/zero vector".into(),
+                    ));
+                }
+                Ok((offset as u32, vector))
+            })
+            .collect()
+    }
+
     pub fn open(path: &Path, embedder: Arc<dyn Embedder>) -> Result<VectorPlane> {
         let db = Database::create(path)?;
         let txn = db.begin_write()?;
@@ -215,6 +234,7 @@ impl VectorPlane {
         &mut self,
         first_lsn: u64,
         changes: &[Change],
+        remove_oids: &[u64],
         catalog: &Catalog,
         caes: &Store,
     ) -> Result<()> {
@@ -224,9 +244,19 @@ impl VectorPlane {
         {
             let mut table = txn.open_table(VECTORS)?;
             let mut meta = txn.open_table(META)?;
+            for oid in remove_oids {
+                table.remove(*oid)?;
+            }
             for (i, ch) in changes.iter().enumerate() {
                 if first_lsn + i as u64 <= self.applied_lsn {
                     continue;
+                }
+                if let Change::Upsert { path, .. } = ch {
+                    if let Some((oid, rec)) = catalog.get_by_path(path)? {
+                        if rec.content_hash.is_none() {
+                            table.remove(oid)?;
+                        }
+                    }
                 }
                 let Change::SetContent {
                     path,
@@ -242,18 +272,15 @@ impl VectorPlane {
                 };
                 let Some(rec) = caes.get(&CaesKey {
                     content_hash: *content_hash,
-                    extractor_id: EXTRACTOR_ID.into(),
-                    extractor_version: EXTRACTOR_VERSION,
+                    extractor_id: rsd_extract::EXTRACTOR_ID.into(),
+                    extractor_version: rsd_extract::EXTRACTOR_VERSION,
                     hints_hash: *hints_hash,
                     abi_version: ABI_VERSION,
                 })?
                 else {
                     continue;
                 };
-                let chunks: Vec<(u32, Vec<f32>)> = chunk(&rec.text)
-                    .into_iter()
-                    .map(|(off, text)| (off as u32, self.embedder.embed(&text)))
-                    .collect();
+                let chunks = self.embed_chunks(&rec.text)?;
                 let doc = DocVectors {
                     embedder_id: self.embedder.id().to_string(),
                     embedder_version: self.embedder.version(),
@@ -270,12 +297,88 @@ impl VectorPlane {
         Ok(())
     }
 
-    pub fn remove(&mut self, oid: u64) -> Result<()> {
+    /// Clear the disposable projection and reset its durable watermark.
+    pub fn reset(&mut self) -> Result<()> {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(redb::Durability::Eventual);
         {
             let mut table = txn.open_table(VECTORS)?;
-            table.remove(oid)?;
+            let mut meta = txn.open_table(META)?;
+            let keys: Vec<u64> = table
+                .iter()?
+                .map(|item| item.map(|(key, _)| key.value()))
+                .collect::<std::result::Result<_, _>>()?;
+            for oid in keys {
+                table.remove(oid)?;
+            }
+            meta.insert(APPLIED_LSN, 0)?;
+        }
+        txn.commit()?;
+        self.applied_lsn = 0;
+        Ok(())
+    }
+
+    /// Replace the whole disposable projection with current catalog objects,
+    /// sourcing text only from CAES.
+    pub fn rebuild_current(
+        &mut self,
+        target_lsn: u64,
+        catalog: &Catalog,
+        caes: &Store,
+    ) -> Result<()> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(redb::Durability::Eventual);
+        {
+            let mut table = txn.open_table(VECTORS)?;
+            let mut meta = txn.open_table(META)?;
+            let keys: Vec<u64> = table
+                .iter()?
+                .map(|item| item.map(|(key, _)| key.value()))
+                .collect::<std::result::Result<_, _>>()?;
+            for oid in keys {
+                table.remove(oid)?;
+            }
+            for binding in catalog.content_bindings()? {
+                let Some(record) = caes.get(&CaesKey {
+                    content_hash: binding.content_hash,
+                    extractor_id: rsd_extract::EXTRACTOR_ID.into(),
+                    extractor_version: rsd_extract::EXTRACTOR_VERSION,
+                    hints_hash: binding.hints_hash,
+                    abi_version: ABI_VERSION,
+                })?
+                else {
+                    continue;
+                };
+                let chunks = self.embed_chunks(&record.text)?;
+                let doc = DocVectors {
+                    embedder_id: self.embedder.id().to_string(),
+                    embedder_version: self.embedder.version(),
+                    chunks,
+                };
+                table.insert(binding.oid, postcard::to_allocvec(&doc)?.as_slice())?;
+            }
+            meta.insert(APPLIED_LSN, target_lsn)?;
+        }
+        txn.commit()?;
+        self.applied_lsn = target_lsn;
+        Ok(())
+    }
+
+    pub fn remove(&mut self, oid: u64) -> Result<()> {
+        self.remove_many(&[oid])
+    }
+
+    pub fn remove_many(&mut self, oids: &[u64]) -> Result<()> {
+        if oids.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(redb::Durability::Eventual);
+        {
+            let mut table = txn.open_table(VECTORS)?;
+            for oid in oids {
+                table.remove(*oid)?;
+            }
         }
         txn.commit()?;
         Ok(())
@@ -383,6 +486,23 @@ pub fn rrf(lexical: &[u64], semantic: &[u64], k: usize) -> Vec<u64> {
 mod tests {
     use super::*;
 
+    struct ZeroEmbedder;
+
+    impl Embedder for ZeroEmbedder {
+        fn id(&self) -> &str {
+            "zero"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+        fn embed(&self, _text: &str) -> Vec<f32> {
+            vec![0.0; 4]
+        }
+    }
+
     #[test]
     fn embedder_is_deterministic_and_normalized() {
         let e = HashEmbedder::default();
@@ -418,5 +538,61 @@ mod tests {
     fn rrf_prefers_agreement() {
         let fused = rrf(&[1, 2, 3], &[3, 4, 5], 10);
         assert_eq!(fused[0], 3, "doc ranked by both lists must win");
+    }
+
+    #[test]
+    fn zero_embedding_is_not_persisted_or_watermarked() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(&dir.path().join("catalog.redb")).unwrap();
+        let caes = Store::open(&dir.path().join("caes.redb")).unwrap();
+        let path = dir.path().join("doc.txt").to_string_lossy().into_owned();
+        let stat = rsd_catalog::StatInfo {
+            kind: rsd_catalog::ObjectKind::File,
+            file_id: rsd_catalog::FileId { dev: 1, ino: 1 },
+            size: 4,
+            mtime_ns: 1,
+            birthtime_ns: 1,
+            nlink: 1,
+        };
+        let content_hash = [3u8; 32];
+        let hints_hash = [7u8; 32];
+        let key = CaesKey {
+            content_hash,
+            extractor_id: rsd_extract::EXTRACTOR_ID.into(),
+            extractor_version: rsd_extract::EXTRACTOR_VERSION,
+            hints_hash,
+            abi_version: ABI_VERSION,
+        };
+        caes.put(
+            &key,
+            &rsd_caes::ExtractionRecord {
+                status: rsd_caes::ExtractStatus::Complete,
+                text: "some text".into(),
+                attrs: vec![],
+                symbols: vec![],
+            },
+        )
+        .unwrap();
+        let changes = vec![
+            Change::Upsert {
+                path: path.clone(),
+                stat,
+            },
+            Change::SetContent {
+                path,
+                content_hash,
+                hints_hash,
+                state: "complete".into(),
+            },
+        ];
+        catalog.apply_changes(1, &changes).unwrap();
+        let mut plane =
+            VectorPlane::open(&dir.path().join("vector.redb"), Arc::new(ZeroEmbedder)).unwrap();
+        assert!(matches!(
+            plane.apply(1, &changes, &[], &catalog, &caes),
+            Err(VectorError::Embedding(_))
+        ));
+        assert_eq!(plane.applied_lsn(), 0);
+        assert!(plane.search("text", 10).unwrap().is_empty());
     }
 }

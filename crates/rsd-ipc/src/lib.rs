@@ -3,15 +3,78 @@
 //! Transport: Unix domain socket at `<state>/rsd.sock`, same-uid peers only
 //! (checked via getpeereid on the server). Frames: `[len: u32 LE][postcard]`.
 //!
-//! Authorization model v1 (honest scope): two tiers. First-party clients
-//! (same product, same uid) get the full index. Named principals get explicit
-//! path-prefix scope grants; enforcement filters BEFORE any output — results,
-//! counts, and live deltas are all computed over the authorized subset only.
-//! XPC audit-token code identity (third-party app tier) is the documented
-//! next step and rides behind the same Request::Hello handshake.
+//! Authorization model v1 is deny-by-default. Named principals receive an
+//! explicit unrestricted or path-prefix scope; unknown principals receive no
+//! data. Enforcement filters before output — results, counts, and live deltas
+//! are computed over the authorized subset. The current `Hello` identity is
+//! caller-asserted, so the shipped daemon configures no UDS grants until XPC
+//! audit-token identity or an equivalent verifier is wired.
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+/// A path-rooted authorization grant.
+///
+/// Matching uses path components rather than string prefixes, so a grant for
+/// `/root/docs` includes `/root/docs/report.txt` but not `/root/docs-private`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PathPrefix(PathBuf);
+
+impl PathPrefix {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+
+    pub fn matches(&self, path: impl AsRef<Path>) -> bool {
+        path.as_ref().starts_with(&self.0)
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl From<String> for PathPrefix {
+    fn from(path: String) -> Self {
+        Self::new(path)
+    }
+}
+
+impl From<&str> for PathPrefix {
+    fn from(path: &str) -> Self {
+        Self::new(path)
+    }
+}
+
+/// Complete authorization scope for a principal.
+///
+/// Unrestricted access is deliberately explicit. `Paths(Vec::new())` is the
+/// deny-all scope used for unknown and revoked principals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    Unrestricted,
+    Paths(Vec<PathPrefix>),
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self::Paths(Vec::new())
+    }
+}
+
+impl Scope {
+    pub fn paths(paths: impl IntoIterator<Item = impl Into<PathPrefix>>) -> Self {
+        Self::Paths(paths.into_iter().map(Into::into).collect())
+    }
+
+    pub fn allows(&self, path: impl AsRef<Path>) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::Paths(prefixes) => prefixes.iter().any(|prefix| prefix.matches(&path)),
+        }
+    }
+}
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
@@ -92,4 +155,24 @@ pub fn recv<T: for<'de> Deserialize<'de>>(r: &mut impl Read) -> Result<T, IpcErr
     let mut payload = vec![0u8; len as usize];
     r.read_exact(&mut payload)?;
     Ok(postcard::from_bytes(&payload)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_is_deny_by_default_and_unrestricted_is_explicit() {
+        assert!(!Scope::default().allows("/root/anything"));
+        assert!(Scope::Unrestricted.allows("/root/anything"));
+    }
+
+    #[test]
+    fn path_scope_matches_components_not_string_prefixes() {
+        let scope = Scope::paths(["/root/docs"]);
+        assert!(scope.allows("/root/docs"));
+        assert!(scope.allows("/root/docs/report.txt"));
+        assert!(!scope.allows("/root/docs-private/report.txt"));
+        assert!(!scope.allows("/root/doc"));
+    }
 }

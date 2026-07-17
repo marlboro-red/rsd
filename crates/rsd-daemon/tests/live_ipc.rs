@@ -7,7 +7,7 @@ use rsd_daemon::ipc::{start_ipc, AuthzStore, IpcCtx};
 use rsd_daemon::{bring_up, ContentIndexer, ContentSource, PipelineConfig};
 use rsd_extract::{extract_bytes, Budgets, ExtractHints};
 use rsd_ingest::CoalescerConfig;
-use rsd_ipc::{recv, send, Request, Response};
+use rsd_ipc::{recv, send, Request, Response, Scope};
 use rsd_lexical::{LexicalPlane, LexicalReader};
 use rsd_live::{LiveEngine, LiveEvent};
 use std::os::unix::net::UnixStream;
@@ -20,12 +20,16 @@ struct Src(Arc<AtomicU64>);
 impl ContentSource for Src {
     fn extract_file(
         &mut self,
-        path: &std::path::Path,
+        file: &std::fs::File,
+        _path: &std::path::Path,
         hints: &ExtractHints,
         budgets: &Budgets,
     ) -> Result<rsd_caes::ExtractionRecord, String> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let mut file = file.try_clone().map_err(|error| error.to_string())?;
+        std::io::Seek::rewind(&mut file).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| error.to_string())?;
         Ok(extract_bytes(hints, budgets, &bytes))
     }
 }
@@ -124,7 +128,9 @@ fn expect_event(s: &mut UnixStream, deadline: Duration) -> Response {
 
 #[test]
 fn subscribe_streams_enters_and_leaves_over_ipc() {
-    let env = setup(AuthzStore::default());
+    let mut authz = AuthzStore::default();
+    authz.grant_unrestricted("test");
+    let env = setup(authz);
     // Bootstrap is synchronous, but under parallel test load the watcher may
     // still be settling; fence on the seed files being cataloged.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -176,7 +182,8 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
     // Grants need the concrete root path, so bind a second listener whose
     // authz store scopes the "restricted" principal to <root>/a/ only.
     let mut a = AuthzStore::default();
-    a.grant("restricted", vec![format!("{}/a/", env.root.display())]);
+    a.grant("restricted", vec![format!("{}/a", env.root.display())]);
+    a.grant("revoked", vec![]);
     let sock2 = env.base.join("rsd2.sock");
     start_ipc(
         &sock2,
@@ -198,6 +205,49 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
     )
     .unwrap();
     let _: Response = recv(&mut s).unwrap();
+
+    // Unknown principals are deny-all, not implicit first-party clients.
+    let mut unknown = UnixStream::connect(&sock2).unwrap();
+    send(
+        &mut unknown,
+        &Request::Hello {
+            principal: "unknown".into(),
+        },
+    )
+    .unwrap();
+    let _: Response = recv(&mut unknown).unwrap();
+    send(
+        &mut unknown,
+        &Request::Query {
+            rql: r#"kMDItemFSName == "*.log""#.into(),
+            scope: None,
+            count_only: true,
+        },
+    )
+    .unwrap();
+    assert!(matches!(recv(&mut unknown).unwrap(), Response::Count(0)));
+
+    // An explicit empty grant is also deny-all on the live path.
+    let mut revoked = UnixStream::connect(&sock2).unwrap();
+    send(
+        &mut revoked,
+        &Request::Hello {
+            principal: "revoked".into(),
+        },
+    )
+    .unwrap();
+    let _: Response = recv(&mut revoked).unwrap();
+    send(
+        &mut revoked,
+        &Request::Subscribe {
+            rql: r#"kMDItemFSName == "*.log""#.into(),
+        },
+    )
+    .unwrap();
+    let Response::Subscribed(revoked_initial) = recv(&mut revoked).unwrap() else {
+        panic!("expected revoked subscription acknowledgment")
+    };
+    assert!(revoked_initial.is_empty());
 
     // Counts computed over the authorized subset only.
     send(
@@ -251,6 +301,13 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
         }
         other => panic!("{other:?}"),
     }
+    revoked
+        .set_read_timeout(Some(Duration::from_millis(750)))
+        .unwrap();
+    assert!(
+        recv::<Response>(&mut revoked).is_err(),
+        "deny-all principal received a live event"
+    );
     env.pipeline.stop();
 }
 
@@ -258,11 +315,12 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
 fn incremental_members_equal_fresh_query_after_storm() {
     let env = setup(AuthzStore::default());
     let expr = rsd_query::parse(r#"kMDItemFSSize > 10"#).unwrap();
-    let (view_id, _rx) =
-        env.live
-            .lock()
-            .unwrap()
-            .subscribe(expr.clone(), vec![], initial_oids(&env, &expr), 4096);
+    let (view_id, _rx) = env.live.lock().unwrap().subscribe(
+        expr.clone(),
+        Scope::Unrestricted,
+        initial_oids(&env, &expr),
+        4096,
+    );
 
     // Storm: creates, rewrites across the threshold, deletes, renames.
     for i in 0..40 {
@@ -325,7 +383,7 @@ fn notify_latency_p99_under_10ms() {
     // (the pipeline in front adds coalescer time by design, budgeted apart).
     let mut eng = LiveEngine::new(None);
     let expr = rsd_query::parse(r#"kMDItemFSSize > 0"#).unwrap();
-    let (_, rx) = eng.subscribe(expr, vec![], [], 8192);
+    let (_, rx) = eng.subscribe(expr, Scope::Unrestricted, [], 8192);
     let mut lat = Vec::with_capacity(500);
     for i in 0..500u64 {
         let d = rsd_catalog::Delta {

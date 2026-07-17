@@ -2136,6 +2136,8 @@ name = "rsd-daemon"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "constant_time_eq",
+ "getrandom 0.3.4",
  "nix",
  "rand 0.8.7",
  "rand_chacha 0.3.1",
@@ -2235,6 +2237,7 @@ dependencies = [
  "rsd-caes",
  "rsd-catalog",
  "rsd-extract",
+ "rsd-ipc",
  "rsd-lexical",
  "rsd-query",
  "rsd-vector",
@@ -2273,6 +2276,7 @@ dependencies = [
  "candle-transformers",
  "rsd-vector",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokenizers",
  "tracing",
@@ -2321,6 +2325,7 @@ dependencies = [
 name = "rsd-wasm"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "rsd-caes",
  "tempfile",
  "thiserror 2.0.18",

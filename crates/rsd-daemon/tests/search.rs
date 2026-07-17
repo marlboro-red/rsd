@@ -22,12 +22,16 @@ struct CountingSource {
 impl ContentSource for CountingSource {
     fn extract_file(
         &mut self,
-        path: &Path,
+        file: &std::fs::File,
+        _path: &Path,
         hints: &ExtractHints,
         budgets: &Budgets,
     ) -> Result<rsd_caes::ExtractionRecord, String> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let mut file = file.try_clone().map_err(|error| error.to_string())?;
+        std::io::Seek::rewind(&mut file).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| error.to_string())?;
         Ok(extract_bytes(hints, budgets, &bytes))
     }
 }

@@ -7,20 +7,27 @@
 use rsd_vector::Embedder;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
 
 pub const SIDECAR_ID: &str = "rsd.ane-nl";
+const REQUEST_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(250)
+} else {
+    std::time::Duration::from_secs(10)
+};
 
 struct Pipes {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    responses: mpsc::Receiver<std::io::Result<(usize, Vec<f32>)>>,
+    _reader: std::thread::JoinHandle<()>,
 }
 
 pub struct SidecarEmbedder {
     helper: PathBuf,
-    dim: usize,
+    dim: AtomicUsize,
     pipes: Mutex<Option<Pipes>>,
 }
 
@@ -54,7 +61,7 @@ impl SidecarEmbedder {
         let (pipes, dim) = Self::spawn(&helper).ok()?;
         let s = SidecarEmbedder {
             helper,
-            dim,
+            dim: AtomicUsize::new(dim),
             pipes: Mutex::new(Some(pipes)),
         };
         // Probe: must return a finite, nonzero vector.
@@ -86,18 +93,46 @@ impl SidecarEmbedder {
             let _ = tx.send(r.map(|_| (line, stdout)));
         });
         match rx.recv_timeout(std::time::Duration::from_secs(20)) {
-            Ok(Ok((line, stdout))) => {
+            Ok(Ok((line, mut stdout))) => {
                 let _ = reader.join();
                 let dim = line
                     .trim()
                     .strip_prefix("READY ")
                     .and_then(|d| d.parse::<usize>().ok())
                     .ok_or_else(|| std::io::Error::other(format!("bad READY line: {line:?}")))?;
+                let (response_tx, responses) = mpsc::channel();
+                let response_reader = std::thread::spawn(move || loop {
+                    let result = (|| {
+                        let mut dbuf = [0u8; 4];
+                        stdout.read_exact(&mut dbuf)?;
+                        let out_dim = u32::from_le_bytes(dbuf) as usize;
+                        let byte_len = out_dim
+                            .checked_mul(4)
+                            .ok_or_else(|| std::io::Error::other("embedding dimension overflow"))?;
+                        if byte_len > 64 * 1024 * 1024 {
+                            return Err(std::io::Error::other("embedding response too large"));
+                        }
+                        let mut raw = vec![0u8; byte_len];
+                        stdout.read_exact(&mut raw)?;
+                        let vector = raw
+                            .chunks_exact(4)
+                            .map(|chunk| {
+                                f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                            })
+                            .collect();
+                        Ok((out_dim, vector))
+                    })();
+                    let failed = result.is_err();
+                    if response_tx.send(result).is_err() || failed {
+                        return;
+                    }
+                });
                 Ok((
                     Pipes {
                         child,
                         stdin,
-                        stdout,
+                        responses,
+                        _reader: response_reader,
                     },
                     dim,
                 ))
@@ -111,24 +146,23 @@ impl SidecarEmbedder {
         }
     }
 
-    fn one_shot(pipes: &mut Pipes, text: &str, dim: usize) -> std::io::Result<Vec<f32>> {
+    fn one_shot(pipes: &mut Pipes, text: &str) -> std::io::Result<(usize, Vec<f32>)> {
         let bytes = text.as_bytes();
         let len = (bytes.len().min(16 * 1024 * 1024)) as u32;
         pipes.stdin.write_all(&len.to_le_bytes())?;
         pipes.stdin.write_all(&bytes[..len as usize])?;
         pipes.stdin.flush()?;
-        let mut dbuf = [0u8; 4];
-        pipes.stdout.read_exact(&mut dbuf)?;
-        let out_dim = u32::from_le_bytes(dbuf) as usize;
-        if out_dim != dim {
-            return Err(std::io::Error::other("dim mismatch"));
-        }
-        let mut raw = vec![0u8; out_dim * 4];
-        pipes.stdout.read_exact(&mut raw)?;
-        Ok(raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
+        pipes
+            .responses
+            .recv_timeout(REQUEST_TIMEOUT)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "embedding request timed out")
+                }
+                mpsc::RecvTimeoutError::Disconnected => {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "embedding helper exited")
+                }
+            })?
     }
 }
 
@@ -140,7 +174,7 @@ impl Embedder for SidecarEmbedder {
         1
     }
     fn dim(&self) -> usize {
-        self.dim
+        self.dim.load(Ordering::Relaxed)
     }
     fn embed(&self, text: &str) -> Vec<f32> {
         let mut guard = self.pipes.lock().unwrap();
@@ -148,7 +182,10 @@ impl Embedder for SidecarEmbedder {
         for attempt in 0..2 {
             if guard.is_none() {
                 match Self::spawn(&self.helper) {
-                    Ok((p, _)) => *guard = Some(p),
+                    Ok((p, dim)) => {
+                        self.dim.store(dim, Ordering::Relaxed);
+                        *guard = Some(p);
+                    }
                     Err(e) => {
                         tracing::warn!("rsd-embed respawn failed: {e}");
                         break;
@@ -156,8 +193,11 @@ impl Embedder for SidecarEmbedder {
                 }
             }
             let pipes = guard.as_mut().unwrap();
-            match Self::one_shot(pipes, text, self.dim) {
-                Ok(v) => return v,
+            match Self::one_shot(pipes, text) {
+                Ok((dim, vector)) => {
+                    self.dim.store(dim, Ordering::Relaxed);
+                    return vector;
+                }
                 Err(e) => {
                     tracing::warn!("rsd-embed request failed (attempt {attempt}): {e}");
                     let _ = pipes.child.kill();
@@ -165,7 +205,7 @@ impl Embedder for SidecarEmbedder {
                 }
             }
         }
-        vec![0.0; self.dim] // degraded: a zero vector, never a panic
+        vec![0.0; self.dim()] // typed as invalid by VectorPlane; never persisted
     }
 }
 
@@ -174,5 +214,29 @@ impl Drop for SidecarEmbedder {
         if let Some(mut p) = self.pipes.lock().unwrap().take() {
             let _ = p.child.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn steady_state_request_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("hung-embedder.sh");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\necho 'READY 4'\nread ignored\nsleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (mut pipes, _) = SidecarEmbedder::spawn(&helper).unwrap();
+        let started = std::time::Instant::now();
+        let error = SidecarEmbedder::one_shot(&mut pipes, "request").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let _ = pipes.child.kill();
     }
 }

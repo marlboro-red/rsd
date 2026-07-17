@@ -6,7 +6,11 @@ fn real_subtitles_plugin_strips_timecodes() {
         "../../plugins/subtitles/target/wasm32-unknown-unknown/release/rsd_plugin_subtitles.wasm",
     );
     if !wasm.exists() {
-        eprintln!("plugin wasm not built — skipping");
+        assert!(
+            std::env::var_os("RSD_CI_HELPERS_REQUIRED").is_none(),
+            "CI built the plugin gate but its wasm artifact is missing"
+        );
+        eprintln!("plugin wasm not built — skipping outside helper CI");
         return;
     }
     let mut host = PluginHost::new().unwrap();

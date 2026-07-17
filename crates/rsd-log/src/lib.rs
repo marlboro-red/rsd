@@ -109,6 +109,10 @@ fn segment_name(first_lsn: u64) -> String {
     format!("{first_lsn:020}.rlog")
 }
 
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+}
+
 fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
@@ -133,6 +137,9 @@ struct SegmentScan {
     records: u64,
     /// Where and why decoding stopped short of EOF, if it did.
     corrupt: Option<(u64, String)>,
+    /// True only when the decoder ran out of bytes in the final frame. This is
+    /// the crash-torn-tail case that may be truncated safely.
+    torn_tail: bool,
 }
 
 /// Stream a segment, calling `sink` for each valid record; stops at the first
@@ -151,6 +158,7 @@ fn scan_segment(path: &Path, mut sink: impl FnMut(LogRecord)) -> Result<SegmentS
                 max_lsn: None,
                 records: 0,
                 corrupt: Some((0, "bad segment header".into())),
+                torn_tail: false,
             });
         }
         Err(_) => {
@@ -159,6 +167,7 @@ fn scan_segment(path: &Path, mut sink: impl FnMut(LogRecord)) -> Result<SegmentS
                 max_lsn: None,
                 records: 0,
                 corrupt: Some((0, "truncated segment header".into())),
+                torn_tail: true,
             });
         }
     }
@@ -174,36 +183,45 @@ fn scan_segment(path: &Path, mut sink: impl FnMut(LogRecord)) -> Result<SegmentS
                 max_lsn,
                 records,
                 corrupt: None,
+                torn_tail: false,
             });
         }
-        let stop = |reason: &str, off: u64, max_lsn, records| SegmentScan {
+        let stop = |reason: &str, off: u64, max_lsn, records, torn_tail| SegmentScan {
             valid_end: off,
             max_lsn,
             records,
             corrupt: Some((off, reason.to_string())),
+            torn_tail,
         };
         let mut fixed = [0u8; RECORD_OVERHEAD];
         if r.read_exact(&mut fixed).is_err() {
-            return Ok(stop("truncated record frame", off, max_lsn, records));
+            return Ok(stop("truncated record frame", off, max_lsn, records, true));
         }
         if fixed[0] != RECORD_MARKER {
-            return Ok(stop("bad record marker", off, max_lsn, records));
+            return Ok(stop("bad record marker", off, max_lsn, records, false));
         }
         let len = u32::from_le_bytes([fixed[1], fixed[2], fixed[3], fixed[4]]);
         if len == 0 || len > MAX_PAYLOAD {
-            return Ok(stop("implausible record length", off, max_lsn, records));
+            let frame_reaches_eof = off + RECORD_OVERHEAD as u64 >= file_len;
+            return Ok(stop(
+                "implausible record length",
+                off,
+                max_lsn,
+                records,
+                frame_reaches_eof,
+            ));
         }
         payload.clear();
         payload.resize(len as usize, 0);
         if r.read_exact(&mut payload).is_err() {
-            return Ok(stop("truncated payload", off, max_lsn, records));
+            return Ok(stop("truncated payload", off, max_lsn, records, true));
         }
         let hash = blake3::hash(&payload);
         if hash.as_bytes()[..HASH_LEN] != fixed[5..] {
-            return Ok(stop("checksum mismatch", off, max_lsn, records));
+            return Ok(stop("checksum mismatch", off, max_lsn, records, false));
         }
         let Ok(rec) = postcard::from_bytes::<LogRecord>(&payload) else {
-            return Ok(stop("undecodable payload", off, max_lsn, records));
+            return Ok(stop("undecodable payload", off, max_lsn, records, false));
         };
         max_lsn = Some(rec.lsn);
         records += 1;
@@ -229,11 +247,20 @@ impl Journal {
                 next_lsn = next_lsn.max(m + 1);
             }
             let is_last = i == segments.len() - 1;
+            if let Some((offset, reason)) = &scan.corrupt {
+                if !is_last || !scan.torn_tail {
+                    return Err(LogError::Corrupt {
+                        segment: path.clone(),
+                        offset: *offset,
+                        reason: reason.clone(),
+                    });
+                }
+            }
             if is_last {
-                // Torn tail on the most recent segment is expected after a
-                // crash mid-append: truncate to the last valid record. The
-                // unacknowledged events will be re-delivered (cursor fencing).
-                if scan.corrupt.is_some() {
+                // Only an EOF-truncated final frame is a crash-torn tail. A
+                // checksum/marker failure in the active segment is bit rot and
+                // must not discard the valid records after it.
+                if scan.torn_tail {
                     let f = OpenOptions::new().write(true).open(path)?;
                     if scan.valid_end < 8 {
                         // Crash during segment creation: the header itself is
@@ -273,6 +300,7 @@ impl Journal {
                 f.write_all(SEGMENT_HEADER)?;
                 f.sync_data()?;
                 drop(f);
+                sync_parent(&path)?;
                 (path, first, 8, 0, BTreeSet::new())
             }
         };
@@ -355,8 +383,12 @@ impl Journal {
         };
         let seal_path = self.active_path.with_extension("seal");
         let tmp = seal_path.with_extension("seal.tmp");
-        std::fs::write(&tmp, postcard::to_allocvec(&manifest)?)?;
+        let mut seal = File::create(&tmp)?;
+        seal.write_all(&postcard::to_allocvec(&manifest)?)?;
+        seal.sync_all()?;
+        drop(seal);
         std::fs::rename(&tmp, &seal_path)?;
+        sync_parent(&seal_path)?;
 
         let first = self.next_lsn;
         let path = self.dir.join(segment_name(first));
@@ -364,6 +396,7 @@ impl Journal {
         f.write_all(SEGMENT_HEADER)?;
         f.sync_data()?;
         drop(f);
+        sync_parent(&path)?;
         self.active = OpenOptions::new().append(true).open(&path)?;
         self.active_path = path;
         self.active_first_lsn = first;
@@ -388,15 +421,15 @@ impl Journal {
                 }
             })?;
             if let Some((offset, reason)) = scan.corrupt {
-                if !is_active {
+                if !is_active || !scan.torn_tail {
                     return Err(LogError::Corrupt {
                         segment: path.clone(),
                         offset,
                         reason,
                     });
                 }
-                // Active segment: anything past valid_end was never
-                // acknowledged; open() already truncated it.
+                // Active segment: only an EOF-torn frame reaches here;
+                // open() already truncated it.
                 let _ = i;
             }
         }
@@ -422,8 +455,9 @@ impl Journal {
 }
 
 /// Fenced source cursor (P2.2): "events up to here are durably journaled".
-/// Written atomically (tmp + rename). A missing or corrupt cursor reads as
-/// `None`, which re-delivers — always the safe direction.
+/// Written durably and atomically (fsync tmp + rename + fsync parent). A
+/// missing or corrupt cursor reads as `None`, which re-delivers — always the
+/// safe direction.
 pub struct CursorStore {
     path: PathBuf,
 }
@@ -465,8 +499,12 @@ impl CursorStore {
             .expect("length");
         let bytes = postcard::to_allocvec(&CursorFile { value, hash })?;
         let tmp = self.path.with_extension("cursor.tmp");
-        std::fs::write(&tmp, &bytes)?;
+        let mut file = File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, &self.path)?;
+        sync_parent(&self.path)?;
         Ok(())
     }
 }
@@ -593,6 +631,40 @@ mod tests {
     }
 
     #[test]
+    fn corruption_in_middle_of_active_segment_is_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = dir.path().join(segment_name(1));
+        {
+            let mut journal = Journal::open(
+                dir.path(),
+                JournalConfig {
+                    segment_max_bytes: u64::MAX,
+                    sync_on_append: false,
+                },
+            )
+            .unwrap();
+            for i in 0..20 {
+                journal.append(Source::Synthetic, &[ch(i)]).unwrap();
+            }
+        }
+        let original_len = std::fs::metadata(&seg).unwrap().len();
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes[8 + RECORD_OVERHEAD + 2] ^= 0x80;
+        std::fs::write(&seg, bytes).unwrap();
+
+        let error = match Journal::open(dir.path(), cfg_small()) {
+            Ok(_) => panic!("mid-segment corruption was silently accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, LogError::Corrupt { .. }), "got {error:?}");
+        assert_eq!(
+            std::fs::metadata(&seg).unwrap().len(),
+            original_len,
+            "mid-segment corruption must not truncate the valid suffix"
+        );
+    }
+
+    #[test]
     fn fuzz_arbitrary_bytes_never_panic() {
         let mut rng = ChaCha8Rng::seed_from_u64(99);
         for trial in 0..200 {
@@ -605,8 +677,9 @@ mod tests {
             }
             std::fs::write(dir.path().join(segment_name(1)), &bytes).unwrap();
             // Must not panic; may or may not salvage records.
-            let j = Journal::open(dir.path(), cfg_small()).unwrap();
-            let _ = j.replay(1, |_| {});
+            if let Ok(journal) = Journal::open(dir.path(), cfg_small()) {
+                let _ = journal.replay(1, |_| {});
+            }
         }
     }
 

@@ -12,13 +12,14 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 fn sidecar_embeds_and_paraphrases_beat_unrelated() {
     if std::env::var_os("RSD_EMBED_BIN").is_none() {
-        eprintln!("RSD_EMBED_BIN unset — skipping sidecar test");
+        assert!(
+            std::env::var_os("RSD_CI_HELPERS_REQUIRED").is_none(),
+            "CI requires RSD_EMBED_BIN; helper build/export was skipped"
+        );
+        eprintln!("RSD_EMBED_BIN unset — skipping sidecar test outside helper CI");
         return;
     }
-    let Some(emb) = SidecarEmbedder::discover() else {
-        eprintln!("sidecar did not start — skipping");
-        return;
-    };
+    let emb = SidecarEmbedder::discover().expect("configured sidecar failed to start");
     assert!(emb.dim() > 0);
     let q = emb.embed("automobile repair costs");
     let hit = emb.embed("the mechanic charged a fortune to fix my car");

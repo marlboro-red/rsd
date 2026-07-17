@@ -91,8 +91,9 @@ extraction, no query engine yet — correctness of observation only.
   detection, replay stops at last valid record); fuzz decode never panics.
 
 **P2.2 — Source-cursor fencing [x]**
-- Cursor persisted only after derived records are journaled (CursorStore, atomic
-  tmp+rename, corrupt-reads-as-None so the failure direction is re-delivery).
+- Cursor persisted only after derived records are journaled (CursorStore,
+  fsync-tmp + rename + parent-directory fsync; corrupt-reads-as-None so the
+  failure direction is re-delivery).
 - Note: proven end-to-end via the synthetic-source crash harness; wiring the
   daemon's FSEvents `sinceWhen` resume through the coalescer's pending window is
   deferred to Phase 3 (startup bootstrap rescan covers correctness meanwhile).
@@ -108,12 +109,15 @@ extraction, no query engine yet — correctness of observation only.
   under two paths (copy indexes with zero extraction calls — counter-verified).
 
 **P2.4 — Commit state machine + idempotent apply [x]**
-- Single committer: journal-before-apply, CAES-before-planes, per-plane watermarks,
-  `(lsn, id, plane, version)` idempotency keys; catalog is the first projection.
+- Single committer: journal-before-apply, CAES-before-planes, per-plane watermarks;
+  catalog is the first projection. Catalog replay streams in bounded windows;
+  lagged lexical/vector projections rebuild from current catalog identities + CAES
+  without filesystem reads, avoiding historical path-reuse ambiguity.
 - Success criteria (the crash-injection gate, permanent in CI):
-  - 500 randomized `kill -9` runs (child-process harness) during commit storms →
-    on restart, recovery replays from `min(watermarks)`; catalog equals a
-    never-crashed reference run; zero divergences, zero unscoped repairs.
+  - At least 500 randomized `kill -9`s (child-process harness) during mixed
+    Upsert/RemovePath/SetContent storms. Survivor and fresh catalog, lexical, and
+    vector planes must equal the never-crashed reference/current content set;
+    fresh content planes read only journal-derived catalog state + CAES.
   - Double-apply of any batch is a no-op (idempotency property test).
 
 ## Phase 3 — Extraction fabric v1 (design §10, P3 pillar)
@@ -121,7 +125,8 @@ extraction, no query engine yet — correctness of observation only.
 **P3.1 — Worker protocol + sandboxed pool [x]**
 - `rsd-worker` binary: fd-passing over UDS (`SCM_RIGHTS`), postcard framing,
   Seatbelt profile (no fs, no net, no exec), timeout/kill/respawn, crash quarantine
-  with queryable reason.
+  with queryable reason. Retry counts are persisted in CAES, so restarting does not
+  reset hostile content's quarantine budget.
 - Success: hostile-input test (worker that segfaults/hangs on cue) → daemon
   unaffected, file quarantined after N retries, pool self-heals; sandbox denies
   demonstrated by a probe worker (open("/etc/passwd") fails).
@@ -142,6 +147,12 @@ extraction, no query engine yet — correctness of observation only.
 **P3.3 — Ingest integration [x]**
 - Dispatcher routes Extract items through CAES-check → worker → committer;
   `AttrsOnly` path (rename/chmod) provably skips extraction.
+- Correctness pass: content identity hashes the whole file even when extraction is
+  budget-truncated. The dispatcher opens once, validates that fd against the
+  catalog generation, hashes and extracts through the same fd for native, WASM,
+  OCR, and transcription processors, re-fstats afterward, and revalidates again
+  immediately before the SetContent journal append. Races are discarded for a
+  later watcher/bootstrap retry.
 - Success: end-to-end counter tests — rename storm on 1k indexed files causes 0
   extractions; content change causes exactly 1.
 
@@ -151,8 +162,8 @@ extraction, no query engine yet — correctness of observation only.
 - Schema per design (doc_id fast field, content w/ positions, name n-grams,
   symbols), delete-term+add commit protocol under the Phase-2 watermark, hot RAM
   segment for freshness.
-- Success: crash-injection extended to lexical plane (rebuild-from-CAES row of the
-  failure matrix demonstrated: delete a segment → scoped rebuild, zero fs reads).
+- Success: crash-injection covers the lexical and vector planes, including
+  deletion/invalidation and fresh rebuild from catalog + CAES with zero fs reads.
 
 **P4.2 — RQL v1: versioned grammar, parser, planner, executor [x]**
 - Attribute predicates (typed comparisons, `c`/`d` modifiers, `$time.*`,
@@ -183,17 +194,18 @@ extraction, no query engine yet — correctness of observation only.
   on-disk index across the modifier surface (phrases, wildcards, `c`/`d`);
   documented exclusion: scoring.
 
-**P5.3 — IPC + authorization skeleton [x]**
-- UDS for first-party CLI (same-uid gate via getpeereid); principal model with
-  path-prefix scope grants; enforcement before ANY output (results, counts,
-  live deltas over the authorized subset only); connection audit via tracing.
-- Deferred with rationale: XPC audit-token code identity (the untrusted
-  third-party tier). Until it lands, cross-uid and unknown-binary access does
-  not exist at all — the same-uid UDS gate is the v1 trust boundary. Rides
-  behind the existing Hello handshake when added.
-- Success: **leak suite** — an unauthorized principal cannot distinguish
-  existence/counts/aggregates/timing-class of out-of-scope docs (statistical test);
-  grant revocation re-fences live subscriptions.
+**P5.3 — IPC + authorization skeleton [partial]**
+- UDS same-uid gate via getpeereid; one explicit `Scope` type shared by query and
+  live paths; unknown principals and empty grants deny all; path grants compare
+  components rather than string prefixes. The leak regression covers results,
+  counts, initial subscription state, and live deltas.
+- The `Hello` principal is still caller-asserted. The shipped daemon therefore
+  configures no UDS grants; XPC audit-token identity, persistent/user-visible grant
+  management, dynamic revocation re-fencing, candidate-generation enforcement,
+  aggregates, and statistical timing tests remain T0 targets.
+- Both UDS and loopback HTTP listeners cap active connection threads; excess peers
+  are rejected. Pre-auth handshakes time out, IPC frames and HTTP headers are
+  bounded, and search limits are clamped.
 
 **P5.4 — `rsdfind -live` [x]**
 - Success: end-to-end — live query over a watched tree reflects mutations within
@@ -201,17 +213,18 @@ extraction, no query engine yet — correctness of observation only.
 
 ## Phase 6 — Semantic plane (design §6.5, §8.2, spike 5) [T1]
 
-**P6.1 — learned embedder + ANE sidecar [x]** — MiniLM via candle (CPU,
+**P6.1 — learned embedder + ANE sidecar [partial]** — MiniLM via candle (CPU,
 6.9ms/chunk) AND the ANE sidecar: rsd-embed runs Apple's NLContextualEmbedding
 (512-dim, Neural-Engine transformer, no model files shipped) as a separate
 evictable process behind the Embedder trait; the daemon respawns it
-transparently if it dies (resilience-tested: sidecar killed mid-run, daemon
-survives + keeps indexing). Chain: ANE sidecar > in-process MiniLM > hash. — batched embedding protocol, CoreML/ANE path, candle
-fallback, full idle eviction. Success: ≥ 2k chunks/sec (adopt) or documented
-fallback throughput; RSS returns to baseline after idle timeout.
-**P6.2 [x]** — structure-aware chunks, HNSW segments with
-tombstones, semantic watermark + second delta stream. Success: crash-injection
-extended; chunk-hash dedup counter tests (copy embeds nothing).
+transparently if it dies. READY and steady-state reads are deadline-bounded;
+respawned dimensions are honored; invalid/zero vectors are rejected without
+advancing the vector watermark. Chain: ANE sidecar > in-process MiniLM > hash.
+Batching, typed fallible embedding at the trait boundary, and idle eviction remain.
+**P6.2 [partial]** — structure-aware chunks in a redb exact-scan projection with
+a synchronous semantic watermark. HNSW segments, a second async delta stream, and
+chunk-hash dedup remain targets. Crash injection now covers vector rebuild and
+deletion/invalidation.
 **P6.3 — Hybrid retrieval [x]** (RRF fusion + semantic() operator shipped; NDCG eval harness pending) — RRF fusion, `semantic()` operator, stale-`semantic_gen`
 compensation. Success: NDCG-gated eval harness live (labeled local corpus); hybrid
 p50 < 15ms / p99 < 60ms.
@@ -229,6 +242,9 @@ interactive TCC and hangs for a background daemon). Opt-in per design
 (RSD_TRANSCRIBE=1 + fetched model). pdfium quality upgrade remains. (pdfium in-sandbox, Vision OCR, whisper
 opt-in; power gating). Success: budget/status contract tests incl. adversarial
 archive set; battery gate verified via powermetrics protocol.
+- Processor routing is decided once and returns the real CAES identity. OCR
+  settings, transcription model revision, and the full WASM module hash enter the
+  cache key; a canonical CAES alias preserves projection rebuild compatibility.
 **P7.2 — WASM extractor ABI** (WIT interface, fuel/memory/output budgets, EPUB
 reference plugin). Success: within 2× native throughput on text-heavy formats;
 hostile-plugin suite (infinite loop, alloc bomb, output flood) all contained.
