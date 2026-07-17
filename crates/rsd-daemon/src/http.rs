@@ -15,6 +15,7 @@ use rsd_ipc::Scope;
 use rsd_lexical::LexicalReader;
 use rsd_query::{parse, QueryEngine};
 use serde_json::json;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
@@ -195,14 +196,22 @@ fn serve(
 
     match path.as_str() {
         "/api/status" => {
+            let (entries, objects) = scoped_catalog_counts(&ctx.catalog, scope).unwrap_or((0, 0));
             let body = json!({
-                "entries": ctx.catalog.entry_count().unwrap_or(0),
-                "objects": ctx.catalog.object_count().unwrap_or(0),
+                "entries": entries,
+                "objects": objects,
                 "semantic": ctx.vector.is_some(),
             });
             respond(&mut stream, "200 OK", &body.to_string())
         }
         "/api/metrics" => {
+            if !matches!(scope, Scope::Unrestricted) {
+                return respond(
+                    &mut stream,
+                    "403 Forbidden",
+                    r#"{"error":"global metrics require unrestricted scope"}"#,
+                );
+            }
             // The metric plane snapshot (§18.5.2). Cardinality-bounded by
             // construction; behind the same loopback-token gate as everything.
             rsd_metrics::metrics()
@@ -322,6 +331,31 @@ fn scope_grants(scope: &Scope) -> Option<Vec<PathBuf>> {
                 .collect(),
         ),
     }
+}
+
+fn scoped_catalog_counts(
+    catalog: &rsd_catalog::Catalog,
+    scope: &Scope,
+) -> rsd_catalog::Result<(u64, u64)> {
+    if matches!(scope, Scope::Unrestricted) {
+        return Ok((catalog.entry_count()?, catalog.object_count()?));
+    }
+    let Some(grants) = scope_grants(scope) else {
+        unreachable!("unrestricted scope returned above")
+    };
+    let mut paths = HashSet::new();
+    for grant in grants {
+        for path in catalog.subtree_paths(&grant.to_string_lossy())? {
+            paths.insert(path);
+        }
+    }
+    let mut objects = HashSet::new();
+    for path in &paths {
+        if let Some((oid, _)) = catalog.get_by_path(path)? {
+            objects.insert(oid);
+        }
+    }
+    Ok((paths.len() as u64, objects.len() as u64))
 }
 
 fn run_http_query(
@@ -536,10 +570,16 @@ mod tests {
             limit: 10,
         };
         let expr = parse("kMDItemFSSize > 0").unwrap();
-        let hits = run_http_query(&engine, &expr, &Scope::paths(["/allowed"])).unwrap();
+        let scope = Scope::paths(["/allowed"]);
+        let hits = run_http_query(&engine, &expr, &scope).unwrap();
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/allowed/a.txt");
+        assert_eq!(scoped_catalog_counts(&catalog, &scope).unwrap(), (1, 1));
+        assert_eq!(
+            scoped_catalog_counts(&catalog, &Scope::Unrestricted).unwrap(),
+            (2, 2)
+        );
     }
 
     #[test]

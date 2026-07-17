@@ -676,7 +676,8 @@ visibility; it grants it explicitly.
   threshold. Aggregates and statistical timing tests remain unfinished. The
   token-authenticated loopback UI surface carries one explicit startup scope
   (currently unrestricted for the first-party app); search, hybrid fusion, and
-  live subscriptions enforce it through the same query/live engines.
+  live subscriptions enforce it through the same query/live engines. Status counts
+  are scope-derived, and restricted scopes cannot read global metrics.
 - **Enforcement-point target**: scope filters constrain **candidate generation**, not final
   results — counts, aggregates, group-bys, rank positions, snippets, and live-view
   deltas are computed over the authorized subset only. Provenance traversal clips at

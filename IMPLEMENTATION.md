@@ -220,7 +220,8 @@ extraction, no query engine yet — correctness of observation only.
   are rejected. Pre-auth handshakes time out, IPC frames and HTTP headers are
   bounded, and search limits are clamped. The HTTP listener receives an explicit
   startup scope (unrestricted for today's first-party app) and applies it to
-  lexical, semantic, hybrid, and live-view execution.
+  lexical, semantic, hybrid, and live-view execution. Status counts are scoped;
+  the global metrics endpoint requires unrestricted scope.
 
 **P5.4 — `rsdfind -live` [x]**
 - Success: end-to-end — live query over a watched tree reflects mutations within
