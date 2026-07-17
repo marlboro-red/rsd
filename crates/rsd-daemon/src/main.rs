@@ -199,6 +199,7 @@ fn main() -> std::io::Result<()> {
     let _http = rsd_daemon::http::start_http(
         5871,
         token,
+        rsd_ipc::Scope::Unrestricted,
         rsd_daemon::ipc::IpcCtx {
             catalog: catalog.clone(),
             lexical_dir: state.join("lexical"),

@@ -674,7 +674,9 @@ visibility; it grants it explicitly.
   RQL counts use uncapped counting paths over the authorized candidate set; ranked
   semantic predicates reject exact-count requests because membership has no
   threshold. Aggregates and statistical timing tests remain unfinished. The
-  token-authenticated loopback UI surface is separate.
+  token-authenticated loopback UI surface carries one explicit startup scope
+  (currently unrestricted for the first-party app); search, hybrid fusion, and
+  live subscriptions enforce it through the same query/live engines.
 - **Enforcement-point target**: scope filters constrain **candidate generation**, not final
   results — counts, aggregates, group-bys, rank positions, snippets, and live-view
   deltas are computed over the authorized subset only. Provenance traversal clips at

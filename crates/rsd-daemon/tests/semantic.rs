@@ -101,6 +101,15 @@ fn semantic_and_hybrid_queries_answer_through_the_daemon() {
     let hits = engine.hybrid("schedule maintenance dilithium", 5).unwrap();
     assert!(hits[0].path.ends_with("engine.txt"), "{hits:?}");
 
+    // Scoped hybrid retrieval constrains both lexical and semantic candidates
+    // before fusion; an out-of-scope high rank cannot consume the budget.
+    let billing_scope = root.join("billing.txt");
+    let hits = engine
+        .hybrid_tagged_authorized("schedule maintenance", 5, &[billing_scope])
+        .unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].0.path.ends_with("billing.txt"), "{hits:?}");
+
     // Mixed predicate: semantic AND attribute.
     let hits = engine
         .run(

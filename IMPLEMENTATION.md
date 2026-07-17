@@ -218,7 +218,9 @@ extraction, no query engine yet — correctness of observation only.
   per-object index membership rather than a capped precomputed oid set.
 - Both UDS and loopback HTTP listeners cap active connection threads; excess peers
   are rejected. Pre-auth handshakes time out, IPC frames and HTTP headers are
-  bounded, and search limits are clamped.
+  bounded, and search limits are clamped. The HTTP listener receives an explicit
+  startup scope (unrestricted for today's first-party app) and applies it to
+  lexical, semantic, hybrid, and live-view execution.
 
 **P5.4 — `rsdfind -live` [x]**
 - Success: end-to-end — live query over a watched tree reflects mutations within

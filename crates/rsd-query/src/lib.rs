@@ -959,20 +959,60 @@ impl<'a> QueryEngine<'a> {
         text: &str,
         k: usize,
     ) -> Result<Vec<(Hit, rsd_vector::MatchOrigin)>> {
+        self.hybrid_tagged_with_scopes(text, k, None)
+    }
+
+    pub fn hybrid_tagged_authorized(
+        &self,
+        text: &str,
+        k: usize,
+        grants: &[PathBuf],
+    ) -> Result<Vec<(Hit, rsd_vector::MatchOrigin)>> {
+        self.hybrid_tagged_with_scopes(text, k, Some(grants))
+    }
+
+    fn hybrid_tagged_with_scopes(
+        &self,
+        text: &str,
+        k: usize,
+        grants: Option<&[PathBuf]>,
+    ) -> Result<Vec<(Hit, rsd_vector::MatchOrigin)>> {
         let lex = self.lexical.ok_or(QueryError::NoLexicalPlane)?;
         let vp = self.vector.ok_or(QueryError::NoVectorPlane)?;
-        let lexical = lex.search_content(text, false, k.max(50))?;
-        let semantic: Vec<u64> = vp
-            .search(text, k.max(50))
-            .map_err(|e| QueryError::Unsupported(e.to_string()))?
-            .into_iter()
-            .map(|h| h.oid)
-            .collect();
+        let effective = effective_scopes(None, grants);
+        if effective.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        let allowed_path = |path: &str| {
+            effective.as_ref().is_none_or(|scopes| {
+                scopes
+                    .iter()
+                    .any(|scope| Path::new(path).starts_with(scope))
+            })
+        };
+        let lexical = match &effective {
+            Some(scopes) => {
+                let refs: Vec<&Path> = scopes.iter().map(PathBuf::as_path).collect();
+                lex.search_content_scoped(text, false, &refs, k.max(50))?
+            }
+            None => lex.search_content(text, false, k.max(50))?,
+        };
+        let semantic: Vec<u64> = match effective.as_deref() {
+            Some(scopes) => {
+                let allowed_oids = self.authorized_oids(Some(scopes))?;
+                vp.search_filtered(text, k.max(50), |oid| allowed_oids.contains(&oid))
+            }
+            None => vp.search(text, k.max(50)),
+        }
+        .map_err(|e| QueryError::Unsupported(e.to_string()))?
+        .into_iter()
+        .map(|h| h.oid)
+        .collect();
         let fused = rsd_vector::rrf_tagged(&lexical, &semantic, k);
         let mut out = Vec::with_capacity(fused.len());
         for (oid, origin) in fused {
             if let Some(rec) = self.catalog.get_object(oid)? {
-                if let Some(p) = rec.entry_paths.first() {
+                if let Some(p) = rec.entry_paths.iter().find(|path| allowed_path(path)) {
                     out.push((
                         Hit {
                             oid,
