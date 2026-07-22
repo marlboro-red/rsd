@@ -272,16 +272,95 @@ fn add_path_scopes(doc: &mut TantivyDocument, field: Field, paths: &[String]) {
     }
 }
 
+/// The tokenizer the `content` field is indexed with. Named here so the
+/// single-doc matcher can resolve the *same registered analyzer* instead of
+/// rebuilding an equivalent chain by hand (DESIGN.md §9).
+pub const CONTENT_TOKENIZER: &str = "default";
+
+/// Strip the RQL wildcard markers a caller may have left on each word. Shared
+/// with `rsd_live`'s single-doc matcher, which must normalize identically.
+pub fn strip_wildcards(terms: &str) -> String {
+    terms
+        .split_whitespace()
+        .map(|term| term.trim_matches('*'))
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Build a throwaway index holding one document's content, using the real
+/// schema and the real analyzer.
+///
+/// Exists for the §9 membership property: comparing the single-doc matcher
+/// against the on-disk plane requires a plane containing exactly that
+/// document, and building one through the commit pipeline would test the
+/// pipeline rather than the tokenizers.
+pub fn single_doc_index(dir: &Path, oid: u64, text: &str) -> Result<LexicalReader> {
+    let reader = LexicalReader::open(dir)?;
+    let mut writer = reader.index.writer(15_000_000)?;
+    let mut doc = TantivyDocument::default();
+    doc.add_u64(reader.f_oid, oid);
+    doc.add_text(reader.f_content, text);
+    writer.add_document(doc)?;
+    writer.commit()?;
+    reader.reader.reload()?;
+    Ok(reader)
+}
+
 impl LexicalReader {
-    /// Word/phrase membership query over a field. `terms` are whitespace-split
-    /// and lowercased (matching the default tokenizer); multiple terms become
-    /// a phrase when `phrase`, else an AND of terms.
+    /// The name of the tokenizer a field is *indexed* with, straight from the
+    /// schema. Asking the schema rather than assuming is the whole point: the
+    /// query side previously assumed whitespace splitting for every field,
+    /// which silently disagreed with `content`'s analyzer on any term
+    /// containing punctuation.
+    fn tokenizer_name(&self, field: Field) -> Option<String> {
+        match self.index.schema().get_field_entry(field).field_type() {
+            tantivy::schema::FieldType::Str(options) => options
+                .get_indexing_options()
+                .map(|indexing| indexing.tokenizer().to_string()),
+            _ => None,
+        }
+    }
+
+    /// The exact index terms a query string produces for a field.
+    ///
+    /// Analyzed fields (`content`) run through the *registered* analyzer — the
+    /// same instance the writer used — so a query term can never be a string
+    /// the indexer would have split. Raw fields (`symbols`) are whole-value
+    /// terms, lowercased to match how the writer stores them.
+    fn query_terms(&self, field: Field, terms: &str) -> Vec<String> {
+        let normalized = strip_wildcards(terms);
+        if normalized.is_empty() {
+            return Vec::new();
+        }
+        match self.tokenizer_name(field).as_deref() {
+            // `raw` is tantivy's untokenized analyzer (what STRING selects).
+            None | Some("raw") => normalized
+                .split_whitespace()
+                .map(|term| term.to_lowercase())
+                .collect(),
+            Some(name) => {
+                let Some(mut analyzer) = self.index.tokenizers().get(name) else {
+                    // A field indexed with an analyzer we cannot resolve must
+                    // not silently fall back to whitespace splitting — that is
+                    // the bug this function exists to prevent.
+                    return Vec::new();
+                };
+                let mut stream = analyzer.token_stream(&normalized);
+                let mut out = Vec::new();
+                while let Some(token) = stream.next() {
+                    out.push(token.text.clone());
+                }
+                out
+            }
+        }
+    }
+
+    /// Membership query over a field. Non-phrase queries are an AND over the
+    /// analyzed terms — boolean membership, matching `rsd_live::DocMatcher`
+    /// exactly (DESIGN.md §9). `phrase` additionally requires adjacency.
     fn field_query(&self, field: Field, terms: &str, phrase: bool) -> Option<Box<dyn Query>> {
-        let toks: Vec<String> = terms
-            .split_whitespace()
-            .map(|t| t.trim_matches('*').to_lowercase())
-            .filter(|t| !t.is_empty())
-            .collect();
+        let toks = self.query_terms(field, terms);
         match toks.len() {
             0 => None,
             1 => Some(Box::new(TermQuery::new(
@@ -518,6 +597,60 @@ pub fn rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CONTENT_TOKENIZER` is what the matcher resolves; the schema says what
+    /// the writer actually used. If `TEXT` ever stops meaning "default", the
+    /// two sides would silently diverge again — so assert they agree.
+    #[test]
+    fn content_tokenizer_constant_matches_the_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = LexicalReader::open(tmp.path()).unwrap();
+        assert_eq!(
+            reader.tokenizer_name(reader.f_content).as_deref(),
+            Some(CONTENT_TOKENIZER)
+        );
+        assert_eq!(
+            reader.tokenizer_name(reader.f_symbols).as_deref(),
+            Some("raw")
+        );
+        assert!(reader.index.tokenizers().get(CONTENT_TOKENIZER).is_some());
+    }
+
+    /// The bug: query terms were whitespace-split while `content` is indexed
+    /// with an analyzer that splits on punctuation, so any punctuated term was
+    /// searched for as a whole and never matched.
+    #[test]
+    fn punctuated_query_terms_match_analyzed_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = LexicalReader::open(tmp.path()).unwrap();
+        let mut writer = reader.index.writer(15_000_000).unwrap();
+        let mut doc = TantivyDocument::default();
+        doc.add_u64(reader.f_oid, 1);
+        doc.add_text(reader.f_content, "quarterly foo-bar report o'brien end");
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        reader.reader.reload().unwrap();
+
+        for query in ["foo-bar", "o'brien", "FOO-BAR", "quarterly", "foo"] {
+            assert!(
+                !reader.search_content(query, false, 10).unwrap().is_empty(),
+                "query {query:?} should match the indexed content"
+            );
+        }
+        assert!(reader
+            .search_content("absent-term", false, 10)
+            .unwrap()
+            .is_empty());
+        // Raw fields keep whole-value semantics: an identifier is not split.
+        assert_eq!(
+            reader.query_terms(reader.f_symbols, "ignite_thrusters"),
+            vec!["ignite_thrusters".to_string()]
+        );
+        assert_eq!(
+            reader.query_terms(reader.f_content, "ignite_thrusters"),
+            vec!["ignite".to_string(), "thrusters".to_string()]
+        );
+    }
 
     #[test]
     fn exact_count_is_not_truncated_by_ranked_search_limit() {

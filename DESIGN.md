@@ -584,9 +584,19 @@ Mechanics:
   real old text — never against an already-deleted lexical doc.
 - **Single-doc matcher**: text-membership clauses evaluate against a one-doc RAM index
   sharing the production tokenizer. Claim, precisely: **bit-identical tokenization
-  and boolean membership** with the on-disk index — property-tested. Scoring parity
-  is explicitly *not* claimed (BM25 depends on corpus statistics); scoring lives in
-  the ranked-view class.
+  and boolean membership** with the on-disk index. Scoring parity is explicitly
+  *not* claimed (BM25 depends on corpus statistics); scoring lives in the
+  ranked-view class.
+  Authority: both sides resolve `rsd_lexical::CONTENT_TOKENIZER` from tantivy's
+  registry and share `rsd_lexical::strip_wildcards`; the query side asks the
+  schema which analyzer a field uses rather than assuming whitespace splitting.
+  Failure mode: a field whose analyzer cannot be resolved yields no query terms
+  (no match) rather than falling back to whitespace. Test:
+  `rsd-daemon/tests/tokenization.rs` — a membership property over punctuation,
+  case, Unicode, and over-length terms, plus the named shapes that regressed.
+  *(Until 2026-07 this claim was false in both halves: the on-disk query side
+  whitespace-split while the index analyzer split on punctuation, so `foo-bar`
+  matched in a live view and found nothing on disk.)*
 - **Semantic alerts are threshold semantics by design**, not degraded top-k: a
   standing alert asks "is this new thing similar enough?", which is classification —
   a top-k standing query would let a new document retroactively displace an old

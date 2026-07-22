@@ -17,11 +17,15 @@ use rsd_query::{eval_live, Expr};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::Arc;
-use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer};
+use tantivy::tokenizer::{TextAnalyzer, TokenizerManager};
 
-/// P5.2: tokenizes with tantivy's OWN default analyzer chain (SimpleTokenizer
-/// → RemoveLong(40) → LowerCaser), so membership answers are bit-identical to
-/// what the on-disk index would return for term queries.
+/// P5.2: tokenizes with the *registered* analyzer the on-disk `content` field
+/// is indexed with, so membership answers are bit-identical to what the index
+/// would return for term queries (DESIGN.md §9).
+///
+/// Pulled from tantivy's tokenizer registry by name rather than hand-built:
+/// a replicated filter chain is a second definition that has to stay in sync,
+/// which is how the query side drifted from the index side in the first place.
 pub struct DocMatcher {
     analyzer: std::sync::Mutex<TextAnalyzer>,
 }
@@ -36,10 +40,9 @@ impl DocMatcher {
     pub fn new() -> DocMatcher {
         DocMatcher {
             analyzer: std::sync::Mutex::new(
-                TextAnalyzer::builder(SimpleTokenizer::default())
-                    .filter(RemoveLongFilter::limit(40))
-                    .filter(LowerCaser)
-                    .build(),
+                TokenizerManager::default()
+                    .get(rsd_lexical::CONTENT_TOKENIZER)
+                    .expect("tantivy registers its default tokenizer"),
             ),
         }
     }
@@ -57,17 +60,11 @@ impl DocMatcher {
         out
     }
 
-    /// All query tokens present in the doc (AND membership, `*` stripped —
-    /// identical to the index-side query mapping in rsd-lexical).
+    /// All query tokens present in the doc (AND membership, `*` stripped).
+    /// The normalization is `rsd_lexical`'s own, so the two sides cannot drift.
     pub fn matches_text(&self, doc_text: &str, query_terms: &str) -> bool {
         let doc: HashSet<String> = self.tokens(doc_text).into_iter().collect();
-        let normalized_query = query_terms
-            .split_whitespace()
-            .map(|term| term.trim_matches('*'))
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let q = self.tokens(&normalized_query);
+        let q = self.tokens(&rsd_lexical::strip_wildcards(query_terms));
         !q.is_empty() && q.iter().all(|t| doc.contains(t))
     }
 
