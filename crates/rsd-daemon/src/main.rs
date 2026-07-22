@@ -60,6 +60,10 @@ fn main() -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&state)?;
 
+    // Before anything expensive: a state dir too deep to hold a bound socket
+    // path would otherwise fail only after a full bootstrap walk.
+    rsd_daemon::ipc::check_sock_path(&state.join("rsd.sock"))?;
+
     let (catalog, catalog_rebuilt) =
         rsd_daemon::open_catalog_resilient(&state.join("catalog.redb"), Durability::Eventual)?;
     if catalog_rebuilt {
@@ -176,6 +180,15 @@ fn main() -> std::io::Result<()> {
             ..Default::default()
         },
     )?;
+    // Loopback secret: a random token in a 0600 file. The HTTP surface needs it
+    // so no web page can read the index over 127.0.0.1; the IPC surface accepts
+    // it as first-party authority so `rsdfind` and `rsd-mcp` can query the
+    // running daemon instead of opening the single-writer store directly.
+    // Regenerated each start.
+    let token = rsd_daemon::http::gen_token()?;
+    let token_path = state.join("http.token");
+    rsd_daemon::http::write_token(&token_path, &token)?;
+
     let _ipc = rsd_daemon::ipc::start_ipc(
         &state.join("rsd.sock"),
         rsd_daemon::ipc::IpcCtx {
@@ -184,21 +197,16 @@ fn main() -> std::io::Result<()> {
             vector: vector_handle,
             live,
             authz: Arc::new(rsd_daemon::ipc::AuthzStore::default()),
+            caes: lexical_caes.clone(),
+            first_party_token: Some(token.clone()),
         },
     )?;
     eprintln!("ipc listening at {}", state.join("rsd.sock").display());
 
-    // Loopback secret for the HTTP surface: a random token in a 0600 file the
-    // native app reads. Without it, any web page could read the index over
-    // 127.0.0.1. Regenerated each start.
-    let token = rsd_daemon::http::gen_token()?;
-    let token_path = state.join("http.token");
-    rsd_daemon::http::write_token(&token_path, &token)?;
-
     let caes_for_http = lexical_caes.clone();
     let _http = rsd_daemon::http::start_http(
         5871,
-        token,
+        token.clone(),
         rsd_ipc::Scope::Unrestricted,
         rsd_daemon::ipc::IpcCtx {
             catalog: catalog.clone(),
@@ -206,6 +214,8 @@ fn main() -> std::io::Result<()> {
             vector: vector_handle_http,
             live: live_http,
             authz: Arc::new(rsd_daemon::ipc::AuthzStore::default()),
+            caes: lexical_caes.clone(),
+            first_party_token: Some(token.clone()),
         },
         caes_for_http,
     )?;

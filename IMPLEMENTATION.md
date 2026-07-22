@@ -187,7 +187,11 @@ extraction, no query engine yet — correctness of observation only.
 - Success: `-onlyin`, `-name`, `-count`, `-0`, `--explain` on daemon state
   (`-attr` lands with the attribute store expansion); lexical query MEASURED at
   p50 = 219µs / p99 = 354µs on the 100k-doc corpus — 4.5×/28× inside target.
-  Phase-4 note: rsdfind reads a quiesced state dir; live-daemon IPC is P5.
+  The one-shot path now runs over daemon IPC (`Query`/`Hybrid`), authorized by
+  the loopback token, and falls back to the state dir only when no daemon is
+  listening. Gate: `rsd-cli/tests/live_daemon.rs` drives the real binaries with
+  the daemon's catalog held open, so a client that reverts to opening the store
+  fails on the single-writer lock instead of passing in CI.
 
 ## Phase 5 — Live views, IPC, authorization (design §9, §11, spikes 3–4)
 
@@ -270,8 +274,12 @@ hostile-plugin suite (infinite loop, alloc bomb, output flood) all contained.
 **P7.3 — MCP server [x]** (rsd_search lexical/semantic/hybrid/rql + rsd_snippets with byte offsets, stdio JSON-RPC). Startup requires explicit repeated `--scope`
 roots or an explicit `--unrestricted`; lexical, semantic, hybrid, RQL, and snippets
 share that authority, and tool result limits are clamped to 1,000.
-Success: scope/limit leak regression passes against the MCP process; agent round-trip demo with
-byte-range citations.
+Every tool call is served by the running daemon over IPC. `--scope` travels as
+`Hello.restrict_to` and the daemon serves the intersection with what the client
+is entitled to, so the restriction is enforced during candidate generation
+rather than by this process's own filtering.
+Success: scope/limit leak regression passes against the MCP process *while the
+daemon holds the catalog*; agent round-trip demo with byte-range citations.
 **P7.4 — mdimporter compat** (per-bundle processes, crash quotas). Success: top-10
 common third-party importers run or are cleanly blacklisted; daemon uptime
 unaffected by importer crash storm.

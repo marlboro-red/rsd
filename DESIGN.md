@@ -662,13 +662,30 @@ visibility; it grants it explicitly.
     stored in `rsd-authz`, listable and revocable via `rsdctl grants`.
   - *MCP surface*: its own principal with user-configured scopes; off by default for
     non-first-party agents; every grant visible and auditable.
-- **Transport**: XPC is the identity-bearing surface (T0). UDS remains for the
-  same-product CLI during development.
+- **Transport**: XPC is the identity-bearing surface (T0). UDS carries the
+  same-product CLI and the MCP agent surface. Both are one-shot *and* streaming
+  clients: the catalog is single-writer, so a client cannot open the store while
+  the daemon holds it, and IPC is the only way either queries a live index.
+- **First-party authority on UDS**: `Hello.token` carries the loopback secret
+  from `<state>/http.token` (0600, regenerated each start). A constant-time
+  match grants `Scope::Unrestricted` — deliberately the *same* authority the
+  HTTP surface already grants any reader of that file, so this adds no trust
+  tier. Authority: `IpcCtx::resolve_scope`. Failure mode: an absent or wrong
+  token falls through to the named-grant table, which is deny-by-default.
+  Test: `rsd-cli/tests/live_daemon.rs::an_unauthenticated_client_gets_nothing`
+  (no token and forged token both yield an empty result set).
+- **Client self-restriction**: `Hello.restrict_to` lets a client ask for less
+  than it is entitled to; the daemon serves the *intersection*, so `rsd-mcp
+  --scope` is enforced server-side during candidate generation rather than by
+  the client's own filtering. Authority: `Scope::intersect`. Failure mode: a
+  request wider than the grant cannot escalate, and disjoint roots collapse to
+  deny-all. Test: `rsd-ipc`'s `intersection_never_widens_either_input` and
+  `live_daemon.rs::mcp_scope_is_enforced_by_the_daemon_not_the_client`.
 - **Shipping status (2026-07 correctness pass)**: UDS scope evaluation is
   component-boundary-safe and deny-by-default, including unknown principals and
   explicit empty grants. Its `Hello` principal remains caller-asserted, so the
-  daemon configures no UDS grants; verified first-party identity, persistent grant
-  management, and dynamic revocation remain T0 targets. Lexical documents carry
+  daemon configures no *named* UDS grants; verified first-party identity,
+  persistent grant management, and dynamic revocation remain T0 targets. Lexical documents carry
   non-stored component-ancestor scope terms, catalog enumeration is scope-first,
   and the exact-scan semantic plane filters oids before ranking. Lexical and catalog
   RQL counts use uncapped counting paths over the authorized candidate set; ranked

@@ -174,6 +174,8 @@ fn semantic_alert_fires_on_similar_content_only() {
             vector: None,
             live,
             authz: Arc::new(authz),
+            caes: None,
+            first_party_token: None,
         },
     )
     .unwrap();
@@ -183,6 +185,8 @@ fn semantic_alert_fires_on_similar_content_only() {
         &mut s,
         &Request::Hello {
             principal: "t".into(),
+            token: None,
+            restrict_to: None,
         },
     )
     .unwrap();

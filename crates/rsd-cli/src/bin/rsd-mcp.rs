@@ -4,24 +4,24 @@
 //! Tools: rsd_search (lexical | semantic | hybrid | rql), rsd_snippets
 //! (grounded excerpts with byte offsets — agents cite, not guess).
 //!
-//!   rsd-mcp --state <dir>
+//!   rsd-mcp --state <dir> (--scope <path>... | --unrestricted)
+//!
+//! Every request is served by the running daemon over `<state>/rsd.sock`. The
+//! catalog is a single-writer store, so opening it here would fail outright
+//! whenever the daemon is up — which is exactly when an agent wants to search.
+//!
+//! `--scope` is sent to the daemon as `Hello.restrict_to`, so the daemon
+//! intersects it with what this client is entitled to and enforces the result
+//! during candidate generation. The restriction is server-side; a bug in this
+//! process cannot widen it.
 
-use rsd_caes::{CaesKey, ABI_VERSION};
-use rsd_catalog::{Catalog, Durability};
-use rsd_extract::{EXTRACTOR_ID, EXTRACTOR_VERSION};
-use rsd_lexical::LexicalReader;
-use rsd_query::{parse, QueryEngine};
-use rsd_vector::VectorPlane;
+use rsd_ipc::{recv, send, Request, Response, Snippet};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
+use std::os::unix::net::UnixStream;
 
 struct State {
-    catalog: Catalog,
-    lexical: Option<LexicalReader>,
-    vector: Option<VectorPlane>,
-    caes: Option<rsd_caes::Store>,
-    /// None is explicit unrestricted authority; Some is the granted roots.
-    grants: Option<Vec<std::path::PathBuf>>,
+    stream: UnixStream,
 }
 
 const MAX_TOOL_RESULTS: usize = 1_000;
@@ -70,10 +70,40 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     Ok(Config { state_dir, grants })
 }
 
-fn rsd_ml_or_hash() -> std::sync::Arc<dyn rsd_vector::Embedder> {
-    match rsd_ml::MiniLmEmbedder::load(&rsd_ml::MiniLmEmbedder::default_dir()) {
-        Ok(m) => std::sync::Arc::new(m),
-        Err(_) => std::sync::Arc::new(rsd_vector::HashEmbedder::default()),
+/// Connect to the daemon and complete the Hello handshake, presenting the
+/// loopback token as first-party authority and `--scope` as a self-restriction.
+fn connect(config: &Config) -> Result<UnixStream, String> {
+    let sock = config.state_dir.join("rsd.sock");
+    let mut stream = UnixStream::connect(&sock).map_err(|e| {
+        format!(
+            "cannot reach daemon at {}: {e}\nstart it with `rsd-daemon watch <root> --state {}`",
+            sock.display(),
+            config.state_dir.display()
+        )
+    })?;
+    let token = std::fs::read_to_string(config.state_dir.join("http.token"))
+        .ok()
+        .map(|t| t.trim().to_string());
+    let restrict_to = config.grants.as_ref().map(|grants| {
+        grants
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    });
+    send(
+        &mut stream,
+        &Request::Hello {
+            principal: "rsd-mcp".into(),
+            token,
+            restrict_to,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    match recv::<Response>(&mut stream) {
+        Ok(Response::Hello { .. }) => Ok(stream),
+        Ok(Response::Err(e)) => Err(e),
+        Ok(_) => Err("unexpected response to Hello".into()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -87,16 +117,12 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let st = State {
-        catalog: Catalog::open_with_durability(
-            &config.state_dir.join("catalog.redb"),
-            Durability::Eventual,
-        )
-        .expect("catalog"),
-        lexical: LexicalReader::open(&config.state_dir.join("lexical")).ok(),
-        vector: VectorPlane::open(&config.state_dir.join("vector.redb"), rsd_ml_or_hash()).ok(),
-        caes: rsd_caes::Store::open(&config.state_dir.join("caes.redb")).ok(),
-        grants: config.grants,
+    let mut st = match connect(&config) {
+        Ok(stream) => State { stream },
+        Err(error) => {
+            eprintln!("rsd-mcp: {error}");
+            std::process::exit(1);
+        }
     };
 
     let stdin = std::io::stdin();
@@ -149,8 +175,8 @@ fn main() {
                     .clamp(1, MAX_TOOL_RESULTS as u64) as usize;
                 let kind = a.get("kind").and_then(|k| k.as_str()).unwrap_or("hybrid");
                 let out = match name {
-                    "rsd_search" => run_search(&st, &query, kind, limit),
-                    "rsd_snippets" => run_snippets(&st, &query, limit),
+                    "rsd_search" => run_search(&mut st, &query, kind, limit),
+                    "rsd_snippets" => run_snippets(&mut st, &query, limit),
                     _ => Err(format!("unknown tool {name}")),
                 };
                 Some(match out {
@@ -171,56 +197,58 @@ fn main() {
     }
 }
 
-fn engine<'a>(st: &'a State, limit: usize) -> QueryEngine<'a> {
-    QueryEngine {
-        catalog: &st.catalog,
-        lexical: st.lexical.as_ref(),
-        vector: st.vector.as_ref(),
-        limit: limit.clamp(1, MAX_TOOL_RESULTS),
+/// One request/response round trip on the daemon connection.
+fn call(st: &mut State, request: Request) -> Result<Response, String> {
+    send(&mut st.stream, &request).map_err(|e| e.to_string())?;
+    match recv::<Response>(&mut st.stream) {
+        Ok(Response::Err(e)) => Err(e),
+        Ok(response) => Ok(response),
+        Err(e) => Err(e.to_string()),
     }
 }
 
-fn run_expr(
-    st: &State,
-    expr: &rsd_query::Expr,
-    limit: usize,
-) -> rsd_query::Result<Vec<rsd_query::Hit>> {
-    let engine = engine(st, limit);
-    match &st.grants {
-        None => engine.run(expr, None),
-        Some(grants) => engine.run_authorized(expr, None, grants),
+fn hits_from(response: Response) -> Result<Vec<rsd_ipc::Hit>, String> {
+    match response {
+        Response::Hits(hits) => Ok(hits),
+        other => Err(format!("unexpected response: {other:?}")),
     }
 }
 
-fn run_hybrid(st: &State, query: &str, limit: usize) -> rsd_query::Result<Vec<rsd_query::Hit>> {
-    let engine = engine(st, limit);
-    match &st.grants {
-        None => engine.hybrid(query, limit),
-        Some(grants) => Ok(engine
-            .hybrid_tagged_authorized(query, limit, grants)?
-            .into_iter()
-            .map(|(hit, _)| hit)
-            .collect()),
+fn snippets_from(response: Response) -> Result<Vec<Snippet>, String> {
+    match response {
+        Response::Snippets(snippets) => Ok(snippets),
+        other => Err(format!("unexpected response: {other:?}")),
     }
 }
 
-fn run_search(st: &State, query: &str, kind: &str, limit: usize) -> Result<String, String> {
+fn run_search(st: &mut State, query: &str, kind: &str, limit: usize) -> Result<String, String> {
     let limit = limit.clamp(1, MAX_TOOL_RESULTS);
-    let hits = match kind {
-        "hybrid" => run_hybrid(st, query, limit).map_err(|e| e.to_string())?,
-        "semantic" => {
-            let expr = parse(&format!(r#"semantic("{query}")"#)).map_err(|e| e.to_string())?;
-            run_expr(st, &expr, limit).map_err(|e| e.to_string())?
-        }
-        "rql" => {
-            let expr = parse(query).map_err(|e| e.to_string())?;
-            run_expr(st, &expr, limit).map_err(|e| e.to_string())?
-        }
-        _ => {
-            let expr = parse(&format!(r#""{query}""#)).map_err(|e| e.to_string())?;
-            run_expr(st, &expr, limit).map_err(|e| e.to_string())?
-        }
+    // The daemon owns retrieval and authorization; this builds the request and
+    // renders the answer. `rql` passes the agent's string through verbatim,
+    // which is why every other kind quotes the query into a literal.
+    let request = match kind {
+        "hybrid" => Request::Hybrid {
+            query: query.into(),
+            scope: None,
+            limit: limit as u32,
+        },
+        "semantic" => Request::Query {
+            rql: format!(r#"semantic("{}")"#, query.replace('"', "")),
+            scope: None,
+            count_only: false,
+        },
+        "rql" => Request::Query {
+            rql: query.into(),
+            scope: None,
+            count_only: false,
+        },
+        _ => Request::Query {
+            rql: format!(r#""{}""#, query.replace('"', "")),
+            scope: None,
+            count_only: false,
+        },
     };
+    let hits = hits_from(call(st, request)?)?;
     let lines: Vec<String> = hits.iter().take(limit).map(|h| h.path.clone()).collect();
     Ok(if lines.is_empty() {
         "no results".into()
@@ -229,54 +257,21 @@ fn run_search(st: &State, query: &str, kind: &str, limit: usize) -> Result<Strin
     })
 }
 
-fn run_snippets(st: &State, query: &str, limit: usize) -> Result<String, String> {
+fn run_snippets(st: &mut State, query: &str, limit: usize) -> Result<String, String> {
     let limit = limit.clamp(1, MAX_TOOL_RESULTS);
-    let hits = run_hybrid(st, query, limit).map_err(|e| e.to_string())?;
-    let caes = st.caes.as_ref().ok_or("no CAES store")?;
+    let snippets = snippets_from(call(
+        st,
+        Request::Snippets {
+            query: query.into(),
+            scope: None,
+            limit: limit as u32,
+        },
+    )?)?;
     let mut out = String::new();
-    for h in hits.iter().take(limit) {
-        let Ok(Some(rec)) = st.catalog.get_object(h.oid) else {
-            continue;
-        };
-        let (Some(ch), Some(hh)) = (rec.content_hash, rec.caes_hints_hash) else {
-            continue;
-        };
-        let Ok(Some(er)) = caes.get(&CaesKey {
-            content_hash: ch,
-            extractor_id: EXTRACTOR_ID.into(),
-            extractor_version: EXTRACTOR_VERSION,
-            hints_hash: hh,
-            abi_version: ABI_VERSION,
-        }) else {
-            continue;
-        };
-        // Excerpt around the first query-term occurrence (grounded citation).
-        let lower = er.text.to_lowercase();
-        let needle = query
-            .split_whitespace()
-            .next()
-            .unwrap_or(query)
-            .to_lowercase();
-        let pos = lower.find(&needle).unwrap_or(0);
-        let start = er.text[..pos]
-            .char_indices()
-            .rev()
-            .nth(80)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let end = (pos + 160).min(er.text.len());
-        let mut end_c = end;
-        while !er.text.is_char_boundary(end_c) {
-            end_c -= 1;
-        }
-        let mut start_c = start;
-        while !er.text.is_char_boundary(start_c) {
-            start_c += 1;
-        }
+    for snippet in snippets.iter().take(limit) {
         out.push_str(&format!(
-            "{} [bytes {start_c}..{end_c}]\n  {}\n",
-            h.path,
-            er.text[start_c..end_c].replace('\n', " ")
+            "{} [bytes {}..{}]\n  {}\n",
+            snippet.path, snippet.start, snippet.end, snippet.text
         ));
     }
     Ok(if out.is_empty() {

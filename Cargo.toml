@@ -46,6 +46,7 @@ rsd-ml = { path = "crates/rsd-ml" }
 rsd-metrics = { path = "crates/rsd-metrics" }
 rsd-wasm = { path = "crates/rsd-wasm" }
 rsd-ipc = { path = "crates/rsd-ipc" }
+rsd-daemon = { path = "crates/rsd-daemon" }
 
 blake3 = "1"
 tantivy = "0.24"

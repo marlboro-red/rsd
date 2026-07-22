@@ -10,7 +10,6 @@
 
 use crate::connection_limit::ConnectionLimit;
 use crate::ipc::IpcCtx;
-use rsd_caes::{CaesKey, ABI_VERSION};
 use rsd_ipc::Scope;
 use rsd_lexical::LexicalReader;
 use rsd_query::{parse, QueryEngine};
@@ -34,7 +33,9 @@ pub fn gen_token() -> std::io::Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn token_matches(expected: &str, presented: &str) -> bool {
+/// Constant-time token comparison. Shared with the IPC surface so both
+/// first-party gates have identical timing behavior.
+pub(crate) fn token_matches(expected: &str, presented: &str) -> bool {
     let Ok(expected): Result<&[u8; 32], _> = expected.as_bytes().try_into() else {
         return false;
     };
@@ -468,53 +469,13 @@ fn sse_forward(
     }
 }
 
-/// Grounded excerpt around the first query-term hit (mirrors rsd-mcp).
+/// Grounded excerpt around the first query-term hit. The excerpt logic itself
+/// lives in `crate::snippet` so every surface cites identical spans.
 fn snippet(ctx: &IpcCtx, caes: Option<&rsd_caes::Store>, oid: u64, q: &str) -> String {
-    let Some(caes) = caes else {
-        return String::new();
-    };
-    let Ok(Some(rec)) = ctx.catalog.get_object(oid) else {
-        return String::new();
-    };
-    let (Some(ch), Some(hh)) = (rec.content_hash, rec.caes_hints_hash) else {
-        return String::new();
-    };
-    let Ok(Some(er)) = caes.get(&CaesKey {
-        content_hash: ch,
-        extractor_id: rsd_extract::EXTRACTOR_ID.into(),
-        extractor_version: rsd_extract::EXTRACTOR_VERSION,
-        hints_hash: hh,
-        abi_version: ABI_VERSION,
-    }) else {
-        return String::new();
-    };
-    snippet_window(&er.text, q)
-}
-
-fn snippet_window(text: &str, query: &str) -> String {
-    let needle = query.split_whitespace().next().unwrap_or(query);
-    let pos = text.find(needle).or_else(|| {
-        text.char_indices().find_map(|(start, _)| {
-            let end = start.checked_add(needle.len())?;
-            (end <= text.len()
-                && text.is_char_boundary(end)
-                && text[start..end].eq_ignore_ascii_case(needle))
-            .then_some(start)
-        })
-    });
-    let pos = pos.unwrap_or(0);
-    let mut start = pos.saturating_sub(60);
-    let mut end = pos.saturating_add(140).min(text.len());
-    while !text.is_char_boundary(start) {
-        start -= 1;
+    match crate::snippet::text_for(&ctx.catalog, caes, oid) {
+        Some(text) => crate::snippet::window(&text, q),
+        None => String::new(),
     }
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[start..end]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[cfg(test)]
@@ -599,7 +560,7 @@ mod tests {
     fn snippet_offsets_stay_on_original_unicode_boundaries() {
         let text = "İstanbul planning notes and meeting summary";
         assert_eq!(
-            snippet_window(text, "istanbul"),
+            crate::snippet::window(text, "istanbul"),
             "İstanbul planning notes and meeting summary"
         );
     }

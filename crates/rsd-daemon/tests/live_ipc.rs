@@ -92,6 +92,8 @@ fn setup(authz: AuthzStore) -> Env {
             vector: None,
             live: live.clone(),
             authz: Arc::new(authz),
+            caes: None,
+            first_party_token: None,
         },
     )
     .unwrap();
@@ -112,6 +114,8 @@ fn connect(env: &Env, principal: &str) -> UnixStream {
         &mut s,
         &Request::Hello {
             principal: principal.into(),
+            token: None,
+            restrict_to: None,
         },
     )
     .unwrap();
@@ -153,6 +157,8 @@ fn ipc_count_is_exact_above_the_hit_limit() {
             vector: None,
             live: Arc::new(Mutex::new(LiveEngine::new(None))),
             authz: Arc::new(authz),
+            caes: None,
+            first_party_token: None,
         },
     )
     .unwrap();
@@ -162,6 +168,8 @@ fn ipc_count_is_exact_above_the_hit_limit() {
         &mut stream,
         &Request::Hello {
             principal: "counter".into(),
+            token: None,
+            restrict_to: None,
         },
     )
     .unwrap();
@@ -253,6 +261,8 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
             vector: None,
             live: env.live.clone(),
             authz: Arc::new(a),
+            caes: None,
+            first_party_token: None,
         },
     )
     .unwrap();
@@ -261,6 +271,8 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
         &mut s,
         &Request::Hello {
             principal: "restricted".into(),
+            token: None,
+            restrict_to: None,
         },
     )
     .unwrap();
@@ -272,6 +284,8 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
         &mut unknown,
         &Request::Hello {
             principal: "unknown".into(),
+            token: None,
+            restrict_to: None,
         },
     )
     .unwrap();
@@ -293,6 +307,8 @@ fn leak_suite_scoped_principal_sees_nothing_outside_grants() {
         &mut revoked,
         &Request::Hello {
             principal: "revoked".into(),
+            token: None,
+            restrict_to: None,
         },
     )
     .unwrap();

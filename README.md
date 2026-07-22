@@ -2,9 +2,13 @@
 
 **A reactive, semantic index of everything on your machine.** A ground-up
 replacement for macOS Spotlight's indexing daemon: crash-proof by
-construction, sandboxed extraction, sub-millisecond search, on-device
-semantic understanding, live standing queries, an agent surface (MCP), and a
-native search palette. Nothing ever leaves your Mac.
+construction, sandboxed extraction, on-device semantic understanding, live
+standing queries, an agent surface (MCP), and a native search palette.
+Nothing ever leaves your Mac.
+
+Latency targets are in [DESIGN.md §15](DESIGN.md) and are labeled as targets —
+they are benchmarked (`cargo test -p rsd-daemon --release -- --ignored`), not
+gated in CI.
 
 ## Quick start
 
@@ -16,11 +20,34 @@ cargo build --release && ./scripts/build-app.sh
 open dist/RSD.app                             # then ⌥Space from anywhere
 ```
 
-CLI: `rsdfind --state <state-dir> [--semantic|--hybrid] "query"`, plus
-`-live` standing queries and `-live --semantic` alerts.
-Agents: `rsd-mcp --state <state-dir> --scope <allowed-root>` (repeat `--scope`
-for more roots). Trusted first-party use must opt in explicitly with
-`--unrestricted`. MCP runs over stdio with search + grounded snippets.
+### Searching
+
+```bash
+rsdfind --state <state-dir> '"quarterly invoice"'   # RQL: bare args are RQL
+rsdfind --state <state-dir> --hybrid  "quarterly invoice"   # natural language
+rsdfind --state <state-dir> --semantic "a bill I need to pay"
+rsdfind --state <state-dir> -live '"invoice"'               # standing query
+rsdfind --state <state-dir> -live --semantic "invoice"      # threshold alert
+```
+
+Bare arguments are [RQL](DIVERGENCES.md) — quote a phrase as `'"like this"'`,
+or use `kMDItemFSName == "*.pdf"c`. `--hybrid` and `--semantic` take plain
+language instead.
+
+Queries go to the running daemon over `<state-dir>/rsd.sock`; the client
+proves first-party authority with the loopback token in `<state-dir>/http.token`
+(0600). With no daemon listening, `rsdfind` reads the state dir directly and
+says so on stderr — `--offline` forces that path and fails rather than falling
+back. The catalog is a single-writer store, so the direct path only works on a
+stopped index.
+
+### Agents
+
+`rsd-mcp --state <state-dir> --scope <allowed-root>` (repeat `--scope` for more
+roots). Trusted first-party use must opt in explicitly with `--unrestricted`.
+MCP runs over stdio with search + grounded snippets, and requires a running
+daemon. `--scope` is sent to the daemon and enforced there during candidate
+generation, so a bug in the MCP process cannot widen it.
 
 ## Why it's different
 

@@ -21,6 +21,11 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The client binaries are only meaningful against a running daemon, so the
+# integration test stands one up. Dev-only: no cycle in the build graph.
+rsd-daemon = { workspace = true }
+rsd-ingest = { workspace = true }
+rsd-live = { workspace = true }
 
 [[bin]]
 name = "rsdfind"

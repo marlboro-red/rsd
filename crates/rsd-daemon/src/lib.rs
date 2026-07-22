@@ -12,6 +12,7 @@ pub mod dispatch;
 pub mod http;
 pub mod ipc;
 pub mod ocr;
+mod snippet;
 pub mod transcribe;
 pub mod wasm_source;
 

@@ -2122,9 +2122,12 @@ version = "0.1.0"
 dependencies = [
  "rsd-caes",
  "rsd-catalog",
+ "rsd-daemon",
  "rsd-extract",
+ "rsd-ingest",
  "rsd-ipc",
  "rsd-lexical",
+ "rsd-live",
  "rsd-ml",
  "rsd-query",
  "rsd-vector",
