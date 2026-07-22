@@ -244,18 +244,46 @@ impl Committer {
         Ok(removals.into_iter().collect())
     }
 
+    /// Reclaim orphaned identities: clear their documents out of every
+    /// projection, then let the catalog forget them.
+    ///
+    /// The order is the whole point. Projection deletes commit with an
+    /// unchanged watermark — they carry no LSN of their own — so `recover()`
+    /// cannot tell "swept" from "never swept" by watermark comparison. If the
+    /// catalog forgot the object first, a crash before the projection commit
+    /// would strand documents under an oid nothing can name again, and
+    /// recovery would see every watermark equal to the journal max and rebuild
+    /// nothing. Sweeping projections first inverts that: a crash leaves the
+    /// catalog still naming the orphan, so the next sweep retries, and the
+    /// deletes are idempotent. Races become retries (DESIGN.md §6.8).
+    ///
+    /// An orphan has no entry paths, so its documents are already unreachable
+    /// by query — removing them before the catalog record costs no visibility.
     pub fn sweep_orphans(&mut self, grace: std::time::Duration) -> Result<usize> {
-        let victims = self.catalog.sweep_orphan_oids(grace)?;
+        let victims = self.catalog.orphan_oids(grace)?;
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        self.remove_from_planes(&victims)?;
+        Ok(self.catalog.remove_orphans(&victims, grace)?.len())
+    }
+
+    /// Evict oids from every disposable projection.
+    ///
+    /// Idempotent: deleting an oid no plane holds is a no-op, which is what
+    /// makes a retried sweep safe. Public so a test can stop between the two
+    /// halves of a sweep — the crash point this ordering exists to survive.
+    pub fn remove_from_planes(&mut self, victims: &[u64]) -> Result<()> {
         if let Some((plane, _)) = self.lexical.as_mut() {
-            plane.remove_oids(&victims)?;
+            plane.remove_oids(victims)?;
         }
         if let Some((plane, _)) = self.vector.as_ref() {
             plane
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .remove_many(&victims)?;
+                .remove_many(victims)?;
         }
-        Ok(victims.len())
+        Ok(())
     }
 
     /// Bring every attached projection up to the journal. Catalog replay is

@@ -677,26 +677,61 @@ impl Catalog {
 
     /// Delete objects that have been orphaned longer than `grace`, returning
     /// their oids so disposable projections can remove them too.
-    pub fn sweep_orphan_oids(&self, grace: std::time::Duration) -> Result<Vec<u64>> {
+    /// Objects orphaned longer than `grace`, without removing them.
+    ///
+    /// Read-only on purpose. Forgetting an object and clearing its documents
+    /// out of the projections cannot be one atomic step across two stores, so
+    /// the caller clears the projections *first* and calls `remove_orphans`
+    /// last: an interrupted sweep then leaves the catalog still naming the
+    /// orphan, and the next sweep retries. Removing from the catalog first
+    /// strands documents nothing can name, which no watermark can detect.
+    pub fn orphan_oids(&self, grace: std::time::Duration) -> Result<Vec<u64>> {
+        let cutoff = now_ns().saturating_sub(grace.as_nanos() as u64);
+        let txn = self.db.begin_read()?;
+        let objects = txn.open_table(OBJECTS)?;
+        let mut victims = Vec::new();
+        for item in objects.iter()? {
+            let (k, v) = item?;
+            let rec: ObjectRecord = postcard::from_bytes(v.value())?;
+            if matches!(rec.orphaned_at_ns, Some(ts) if ts <= cutoff) {
+                victims.push(k.value());
+            }
+        }
+        Ok(victims)
+    }
+
+    /// Forget the given objects, skipping any that stopped being orphaned
+    /// since `orphan_oids` observed them. Returns the oids actually removed.
+    ///
+    /// The re-check is redundant while the applier is the single writer, but
+    /// it keeps this safe to call from anywhere: deleting an object a rename
+    /// has just rebound would drop a live document from every plane.
+    pub fn remove_orphans(&self, oids: &[u64], grace: std::time::Duration) -> Result<Vec<u64>> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
         let cutoff = now_ns().saturating_sub(grace.as_nanos() as u64);
         self.with_write(|t| {
-            let mut victims = Vec::new();
-            for item in t.objects.iter()? {
-                let (k, v) = item?;
-                let rec: ObjectRecord = postcard::from_bytes(v.value())?;
-                if matches!(rec.orphaned_at_ns, Some(ts) if ts <= cutoff) {
-                    victims.push(k.value());
+            let mut removed = Vec::new();
+            for oid in oids {
+                let Some(bytes) = t.objects.get(oid)? else {
+                    continue; // already gone: an earlier interrupted sweep
+                };
+                let rec: ObjectRecord = postcard::from_bytes(bytes.value())?;
+                drop(bytes);
+                if !matches!(rec.orphaned_at_ns, Some(ts) if ts <= cutoff) {
+                    continue; // rebound since we looked
                 }
-            }
-            for oid in &victims {
                 delete_object(t, *oid)?;
+                removed.push(*oid);
             }
-            Ok(victims)
+            Ok(removed)
         })
     }
 
     pub fn sweep_orphans(&self, grace: std::time::Duration) -> Result<usize> {
-        Ok(self.sweep_orphan_oids(grace)?.len())
+        let victims = self.orphan_oids(grace)?;
+        Ok(self.remove_orphans(&victims, grace)?.len())
     }
 
     pub fn entry_count(&self) -> Result<u64> {
